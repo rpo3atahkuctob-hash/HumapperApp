@@ -239,16 +239,36 @@ const C = {
 ═══════════════════════════════════════════════ */
 const OM = {
   skull:                   { n:"Череп и лицевой отдел",                e:"🦴", g:"bone" },
+  tmj:                     { n:"Височно-нижнечелюстной сустав",        e:"🦴", g:"bone" },
+  hyoid_laryngeal:         { n:"Подъязычная кость и гортань",          e:"🦴", g:"bone" },
   spine:                   { n:"Позвоночник",                          e:"🦴", g:"bone" },
+  cervical_spine:          { n:"Шейный отдел позвоночника (C1–C7)",    e:"🦴", g:"bone" },
+  thoracic_spine:          { n:"Грудной отдел позвоночника (T1–T12)",  e:"🦴", g:"bone" },
+  lumbar_spine:            { n:"Поясничный отдел позвоночника (L1–L5)",e:"🦴", g:"bone" },
+  sacrum_coccyx:           { n:"Крестец и копчик",                     e:"🦴", g:"bone" },
   ribcage:                 { n:"Рёбра и грудина",                      e:"🦴", g:"bone" },
   pelvis:                  { n:"Тазовые кости",                        e:"🦴", g:"bone" },
-  shoulder_girdle:         { n:"Плечевой пояс",                        e:"🦴", g:"bone" },
-  upper_limb:              { n:"Плечевая кость и предплечье",          e:"🦾", g:"bone" },
+  sacroiliac_pubic_joint:  { n:"Крестцово-подвздошный сустав и лобковый симфиз", e:"🔗", g:"bone" },
+  shoulder_girdle:         { n:"Плечевой пояс (ключица и лопатка)",    e:"🦴", g:"bone" },
+  sternoclavicular_joint:  { n:"Грудино-ключичный сустав",             e:"🔗", g:"bone" },
+  acromioclavicular_joint: { n:"Акромиально-ключичный сустав",         e:"🔗", g:"bone" },
+  shoulder_joint:          { n:"Плечевой сустав",                      e:"🔗", g:"bone" },
+  humerus:                 { n:"Плечевая кость",                       e:"🦴", g:"bone" },
+  upper_limb:              { n:"Верхняя конечность",                   e:"🦾", g:"bone" },
+  elbow_joint:             { n:"Локтевой сустав",                      e:"🔗", g:"bone" },
+  forearm_bones:           { n:"Кости предплечья (лучевая и локтевая)",e:"🦴", g:"bone" },
+  wrist_joint:             { n:"Лучезапястный сустав",                 e:"🔗", g:"bone" },
   wrist_hand:              { n:"Кости кисти и запястья",               e:"✋", g:"bone" },
-  femur:                   { n:"Бедренная кость и кости голени",       e:"🦴", g:"bone" },
-  hip_joint:               { n:"Тазобедренный сустав",                 e:"🦴", g:"bone" },
-  knee_joint:              { n:"Коленный сустав",                      e:"🦴", g:"bone" },
+  hand_bones:              { n:"Кости кисти (пястные и фаланги)",      e:"✋", g:"bone" },
+  hand_joints:             { n:"Суставы кисти",                        e:"🔗", g:"bone" },
+  femur:                   { n:"Бедренная кость",                      e:"🦴", g:"bone" },
+  tibia_fibula:            { n:"Большеберцовая и малоберцовая кости",  e:"🦴", g:"bone" },
+  hip_joint:               { n:"Тазобедренный сустав",                 e:"🔗", g:"bone" },
+  knee_joint:              { n:"Коленный сустав",                      e:"🔗", g:"bone" },
+  ankle_joint:             { n:"Голеностопный сустав",                 e:"🔗", g:"bone" },
   ankle_foot:              { n:"Голеностоп и кости стопы",             e:"🦶", g:"bone" },
+  foot_bones:              { n:"Кости стопы",                          e:"🦶", g:"bone" },
+  foot_joints:             { n:"Суставы стопы",                        e:"🔗", g:"bone" },
 
   brain:                   { n:"Головной мозг",                        e:"🧠", g:"neuro" },
   spinal_cord:             { n:"Спинной мозг",                         e:"⚡", g:"neuro" },
@@ -320,8 +340,31 @@ const OM = {
 };
 
 const ORGAN_ID_ALIASES = {
-  lymph_nodes_cervical: "lymph_nodes_head_neck",
-  lymph_nodes_inguinal: "lymph_nodes_lower_limb",
+  // lymph legacy
+  lymph_nodes_cervical:    "lymph_nodes_head_neck",
+  lymph_nodes_inguinal:    "lymph_nodes_lower_limb",
+  // joints / bones — mirror server aliases
+  temporomandibular_joint: "tmj",
+  jaw_joint:               "tmj",
+  sternoclavicular:        "sternoclavicular_joint",
+  acromioclavicular:       "acromioclavicular_joint",
+  glenohumeral_joint:      "shoulder_joint",
+  shoulder:                "shoulder_joint",
+  humerus_bone:            "humerus",
+  forearm:                 "forearm_bones",
+  hand:                    "hand_bones",
+  hand_joint:              "hand_joints",
+  wrist:                   "wrist_joint",
+  cervical:                "cervical_spine",
+  thoracic:                "thoracic_spine",
+  lumbar:                  "lumbar_spine",
+  sacrococcygeal:          "sacrum_coccyx",
+  sacroiliac_joint:        "sacroiliac_pubic_joint",
+  pubic_symphysis:         "sacroiliac_pubic_joint",
+  lower_leg:               "tibia_fibula",
+  ankle:                   "ankle_joint",
+  foot:                    "foot_bones",
+  foot_joint:              "foot_joints",
 };
 
 function canonicalizeOrganId(id) {
@@ -801,29 +844,60 @@ function inferMajorOrganIdFromMeshName(meshName, cat="visceral") {
   }
 
   if (cat === "skeletal") {
-    if (has(/parietal bone|frontal bone|occipital bone|sphenoid|ethmoid|temporal bone|maxilla|mandible|nasal bone|zygomatic|palatine bone|lacrimal bone|hyoid|malleus|incus|stapes|tooth|incisor|canine|premolar|molar|inferior nasal concha|vomer/)) return "skull";
-    if (has(/vertebra|atlas|axis|coccyx|sacrum/)) return "spine";
-    if (has(/rib|sternum|costal cartilage/)) return "ribcage";
-    if (has(/ilium|ischium|pubis|acetabul/)) return "pelvis";
-    if (has(/clavicle|scapula/)) return "shoulder_girdle";
-    if (has(/humerus|radius|ulna/)) return "upper_limb";
-    if (has(/carpal|metacarpal|phalanx of hand|scaphoid|lunate|triquetrum|pisiform|trapez|capitate|hamate/)) return "wrist_hand";
-    if (has(/femur|tibia|fibula|patella/)) return "femur";
-    if (has(/talus|calcaneus|cuneiform|navicular bone|cuboid bone|metatarsal|phalanx of .* foot/)) return "ankle_foot";
+    if (has(/parietal bone|frontal bone|occipital bone|sphenoid|ethmoid|temporal bone|maxilla|mandible|nasal bone|zygomatic|palatine bone|lacrimal bone|malleus|incus|stapes|tooth|incisor|canine|premolar|molar|inferior nasal concha|vomer/)) return "skull";
+    if (has(/\bhyoid\b/)) return "hyoid_laryngeal";
+    // Vertebrae — split by region
+    if (has(/\batlas\b|\baxis\b|vertebra c\d|cervical vertebra/)) return "cervical_spine";
+    if (has(/vertebra t\d|thoracic vertebra/)) return "thoracic_spine";
+    if (has(/vertebra l\d|lumbar vertebra/)) return "lumbar_spine";
+    if (has(/\bsacrum\b|\bcoccyx\b/)) return "sacrum_coccyx";
+    if (has(/vertebra|vertebral/)) return "spine"; // fallback for unspecified
+    if (has(/\brib\b|\bribs\b|sternum|costal cartilage|manubrium|xiphoid/)) return "ribcage";
+    if (has(/\bilium\b|\bischium\b|\bpubis\b|acetabul/)) return "pelvis";
+    if (has(/clavicle|scapula|acromion/)) return "shoulder_girdle";
+    if (has(/\bhumerus\b/)) return "humerus";
+    if (has(/\bradius\b|\bulna\b/)) return "forearm_bones";
+    if (has(/carpal|metacarpal|phalanx of hand|phalanges of hand|scaphoid|lunate|triquetrum|pisiform|trapezoid bone|trapezium|capitate|hamate/)) return "hand_bones";
+    if (has(/\bfemur\b|femoral/)) return "femur";
+    if (has(/patella/)) return "knee_joint";
+    if (has(/\btibia\b|\bfibula\b/)) return "tibia_fibula";
+    if (has(/talus|calcaneus|cuneiform|navicular bone|cuboid bone|metatarsal|phalanx of.*foot|phalanges of.*foot/)) return "foot_bones";
     return null;
   }
 
   if (cat === "joints") {
-    if (has(/temporomandibular|sphenomandibular|stylomandibular|stylohyoid|pterygospinous|thyrohyoid|cricothyroid|cricopharyngeal/)) return "skull";
-    if (has(/intervertebral disc|nucleus pulposus|supraspinous|interspinous|longitudinal ligament|nuchal ligament|ligamenta flava|sacrococcygeal/)) return "spine";
-    if (has(/intercostal membrane|head of rib|costotransverse|costovertebral|sternocostal/)) return "ribcage";
-    if (has(/acromioclavicular|sternoclavicular|glenohumeral|coraco|scapular|clavicular/)) return "shoulder_girdle";
-    if (has(/elbow joint|annular ligament of radius|radio ulnar|radio-ulnar|ulnar collateral|radial collateral|quadrate ligament/)) return "upper_limb";
-    if (has(/carpal|scapho|triquet|hamate|trapez|piso|metacarp|phalangeal|wrist/)) return "wrist_hand";
-    if (has(/sacroiliac|pubic symphysis/)) return "pelvis";
-    if (has(/hip joint|iliofemoral|ischiofemoral|pubofemoral|ligament of head of femur/)) return "hip_joint";
-    if (has(/knee|meniscus|cruciate|patellar ligament|fibular collateral|tibial collateral/)) return "knee_joint";
-    if (has(/tibiofibular|talocalcaneal|talonavicular|calcaneocuboid|deltoid ligament|plantar|dorsal tarsal|metatarsal/)) return "ankle_foot";
+    // Head/neck joints
+    if (has(/temporomandibular|sphenomandibular|stylomandibular|lateral temporomandibular|articular.*temporomandibular/)) return "tmj";
+    if (has(/thyrohyoid|cricothyroid|cricopharyngeal|stylohyoid|quadrangular membrane|intercornual|pterygospinous/)) return "hyoid_laryngeal";
+    // Spine — split by region
+    if (has(/intervertebral disc c|nucleus pulposus c/)) return "cervical_spine";
+    if (has(/intervertebral disc t|nucleus pulposus t/)) return "thoracic_spine";
+    if (has(/intervertebral disc l|nucleus pulposus l/)) return "lumbar_spine";
+    if (has(/sacrococcygeal symphysis/)) return "sacrum_coccyx";
+    if (has(/intervertebral disc|nucleus pulposus|supraspinous|interspinous|longitudinal ligament|nuchal ligament|ligamenta flava/)) return "spine";
+    // Thorax
+    if (has(/intercostal membrane|head of rib|costotransverse|costovertebral|sternocostal|radiate ligament.*rib|intra-articular.*rib/)) return "ribcage";
+    // Shoulder girdle joints
+    if (has(/sternoclavicular|costoclavicular|interclavicular/)) return "sternoclavicular_joint";
+    if (has(/acromioclavicular|coracoclavicular|conoid ligament|trapezoid ligament|coraco-acromial|superior transverse scapular|inferior transverse scapular/)) return "acromioclavicular_joint";
+    if (has(/glenohumeral|coracohumeral|glenoid labrum|transverse humeral|articular capsule of glenohumeral/)) return "shoulder_joint";
+    // Upper limb joints
+    if (has(/articular capsule of elbow|annular ligament of radius|oblique cord|quadrate ligament|articular disc of.*radio-ulnar|dorsal radio-ulnar|palmar radio-ulnar|interosseous membrane of forearm|radial collateral ligament(?!.*wrist)|ulnar collateral ligament(?!.*wrist)/)) return "elbow_joint";
+    if (has(/radiocarpal|articular capsule of radiocarpal|radial collateral ligament of wrist|ulnar collateral ligament of wrist|dorsal radiocarpal|palmar radiocarpal|ulnocarpal|radioscaphocapitate|radiocapitate|ulnolunate|ulnotriquetral|ulnocapitate|ulnopisiform|lunotriquetral|scapholunate|radiate carpal|palmar lunotriquetral|dorsal ulnocarpal|palmar scaphotriquetral|dorsal scaphotriquetral/)) return "wrist_joint";
+    if (has(/metacarpal|metacarpophalangeal|interphalangeal.*hand|palmar interphalangeal|deep transverse metacarpal|dorsal metacarpal|palmar metacarpal|interosseous metacarpal|collateral.*hand|pisohamate|pisometacarpal|pisotriquetral|capitohamate|scaphocapitate|triquetrocapitate|triquetrohamate|trapeziotrapezoidal|trapezoideocapitate|dorsal carpometacarpal|palmar carpometacarpal|scaphotrapeziotrapezoidal|interosseous.*carpal|dorsal intercarpal/)) return "hand_joints";
+    // Pelvic joints
+    if (has(/sacro-iliac|sacroiliac|pubic symphysis|interpubic disc|pubic ligament|sacrospinous|sacrotuberous|obturator membrane|iliolumbar/)) return "sacroiliac_pubic_joint";
+    if (has(/ilium|ischium|pubis|acetabul/)) return "pelvis";
+    // Hip
+    if (has(/hip joint|acetabular labrum|iliofemoral|ischiofemoral|pubofemoral|ligament of head of femur|transverse acetabular|triradiate cartilage/)) return "hip_joint";
+    // Knee
+    if (has(/knee|meniscus|cruciate|patellar|infrapatellar|meniscopatellar|fibular collateral|tibial collateral|arcuate popliteal|oblique popliteal|popliteofibular|transverse ligament of knee/)) return "knee_joint";
+    // Lower leg — tibiofibular interosseous
+    if (has(/superior tibiofibular|articular capsule of superior tibiofibular|interosseous membrane of leg|anterior ligament of fibular head|posterior ligament of fibular head/)) return "tibia_fibula";
+    // Ankle
+    if (has(/talofibular|calcaneofibular|tibiocalcaneal|tibionavicular|tibiotalar|posterior tibiotalar|tibiofibular|deltoid ligament/)) return "ankle_joint";
+    // Foot joints
+    if (has(/calcaneocuboid|calcaneonavicular|talocalcaneal|talonavicular|cuneocuboid|cuneonavicular|intercuneiform|cuneometatarsal|tarsometatarsal|metatarsophalangeal|metatarsal.*ligament|interphalangeal.*foot|plantar.*ligament|dorsal.*tarsal|dorsal cuneocuboid|dorsal cuneonavicular|dorsal cuboideonavicular|dorsal tarsometatarsal|collateral.*foot|intersesamoid/)) return "foot_joints";
     return null;
   }
 
@@ -2026,7 +2100,7 @@ function BodyModel3D({ gender, od, sel, oc, layerVis, onGroupList, groupVisibili
   function getCat(name) {
     const n = (name||"").toLowerCase();
     // Skeletal
-    if (/\bbone\b|\bbones\b|femur|fibula|tibia\b|radius\b|ulna\b|humerus|vertebra|vertebrae|\brib\b|\bribs\b|skull|cranium|sternum|clavicle|scapula|patella|calcaneus|talus|metatarsal|metacarpal|phalanges|phalang|mandible|maxilla|\bpelvis\b|sacrum|ilium|pubis|ischium|malleus|incus|stapes|ossicle|carpal|capitate|hamate|lunate|pisiform|scaphoid|trapez.*bone|triquetrum|navicular.*bone|cuboid bone|cuneiform bone|sesamoid|ligament|joint\b|capsule\b|\btendon\b|bursa|meniscus|symphysis|retinaculum|aponeurosis/.test(n)) return "skeletal";
+    if (/\bbone\b|\bbones\b|femur|fibula|tibia\b|radius\b|ulna\b|humerus|vertebra|vertebrae|\brib\b|\bribs\b|skull|cranium|sternum|clavicle|scapula|patella|calcaneus|talus|metatarsal|metacarpal|phalanges|phalang|mandible|maxilla|\bpelvis\b|sacrum|ilium|pubis|ischium|malleus|incus|stapes|ossicle|carpal|capitate|hamate|lunate|pisiform|scaphoid|trapez.*bone|triquetrum|navicular.*bone|cuboid bone|cuneiform bone|sesamoid|ligament|joint\b|capsule\b|\btendon\b|bursa|meniscus|symphysis|retinaculum|aponeurosis|atlas|axis|coccyx|acromion|acetabul|hyoid/.test(n)) return "skeletal";
     // Muscular
     if (/\bmuscle\b|\bmuscles\b|pectoral|deltoid|biceps|triceps|quadriceps|glute|hamstring|gastrocnemius|soleus|trapezius|latissimus|rhomboid|erector|masseter|temporal.*muscle|frontalis|orbicularis|zygomaticus|buccinator|sternocleid|splenius|semispinal|intercostal|diaphragm/.test(n)) return "muscular";
     // Cardiovascular
@@ -2104,7 +2178,7 @@ if (xr) {
   const xrayPalette = {
     skeletal:       { op: isSel ? 0.31 : 0.19, factor: 1.00 },
     joints:         { op: isSel ? 0.26 : 0.14, factor: 1.00 },
-    muscular:       { op: isSel ? 0.13 : 0.05, factor: 0.50 },
+    muscular:       { op: isSel ? 0.05 : 0.015,factor: 1.00 },
     cardiovascular: { op: isSel ? 0.29 : 0.16, factor: 0.50 },
     lymphoid:       { op: isSel ? 0.25 : 0.12, factor: 0.50 },
     nervous:        { op: isSel ? 0.23 : 0.11, factor: 0.50 },
@@ -2140,7 +2214,7 @@ mats.forEach(mat => {
   const normalOpacity = {
     skeletal:       { active: isSel ? 0.48 : 0.34, none: isSel ? 0.22 : 0.12, depthWrite: true  },
     joints:         { active: isSel ? 0.44 : 0.28, none: isSel ? 0.20 : 0.11, depthWrite: false },
-    muscular:       { active: isSel ? 0.38 : 0.22, none: isSel ? 0.18 : 0.10, depthWrite: false },
+    muscular:       { active: isSel ? 0.11 : 0.045,none: isSel ? 0.07 : 0.03, depthWrite: false },
     cardiovascular: { active: isSel ? 0.43 : 0.27, none: isSel ? 0.18 : 0.10, depthWrite: false },
     lymphoid:       { active: isSel ? 0.41 : 0.24, none: isSel ? 0.18 : 0.10, depthWrite: false },
     nervous:        { active: isSel ? 0.44 : 0.30, none: isSel ? 0.19 : 0.11, depthWrite: false },
