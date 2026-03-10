@@ -1,0 +1,3 @@
+GEMINI_API_KEY=your_new_gemini_key_hereAIzaSyCSZX3jEWoYle7KMU07SYZAWUlpY-fGJNU
+GEMINI_MODEL=gemini-2.5-flash
+PORT=8080

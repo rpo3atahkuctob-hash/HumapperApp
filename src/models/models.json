@@ -1,0 +1,11 @@
+[
+  { "id": "cardiovascular", "title": "Cardiovascular", "path": "/3d/Cardiovascular.glb" },
+  { "id": "joints", "title": "Joints", "path": "/3d/Joints.glb" },
+  { "id": "lymphoid", "title": "Lymphoid", "path": "/3d/Lymphoid.glb" },
+  { "id": "muscular", "title": "Muscular", "path": "/3d/Muscular.glb" },
+  { "id": "nervous", "title": "Nervous", "path": "/3d/Nervous.glb" },
+  { "id": "outerlayer", "title": "Outer layer", "path": "/3d/Outerlayer.glb" },
+  { "id": "skeletal", "title": "Skeletal", "path": "/3d/Skeletal.glb" },
+  { "id": "visceral", "title": "Visceral", "path": "/3d/Visceral.glb" }
+]
+
