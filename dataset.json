@@ -1,4 +1,6 @@
 {
-  "format": "humapper-patientdb/v1",
-  "patients": []
+  "schema_version": "humapper-patientdb/v1",
+  "patients": [],
+  "timeline_items": [],
+  "organ_data_current": []
 }
