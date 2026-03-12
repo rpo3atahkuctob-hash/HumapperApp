@@ -619,11 +619,153 @@ function signalToStatus(color, subtype = "") {
   return "none";
 }
 
+const CLINICAL_STATUS_ALIASES = {
+  resolved: "healthy",
+  remission: "healthy",
+  inactive: "healthy",
+  recovered: "healthy",
+  healed: "healthy",
+  cured: "healthy",
+  abated: "healthy",
+  abatement: "healthy",
+  disease_free: "healthy",
+  no_evidence_of_disease: "healthy",
+  entered_in_error: "none",
+  cancelled: "none",
+  active: "sick",
+  confirmed: "sick",
+  severe: "sick",
+  abnormal: "sick",
+  suspected: "warning",
+  suspicion: "warning",
+  observation: "warning",
+  monitoring: "warning",
+  followup: "warning",
+  follow_up: "warning",
+  pending: "warning",
+};
+
+function normalizeClinicalStatus(rawStatus, fallbackColor = "", fallbackSubtype = "") {
+  const raw = String(rawStatus || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[.\s-]+/g, "_")
+    .replace(/_+/g, "_");
+  if (!raw) return signalToStatus(fallbackColor, fallbackSubtype) || "none";
+  if (raw === "sick" || raw === "warning" || raw === "healthy" || raw === "none") return raw;
+  if (raw === "completed" || raw === "final" || raw === "unknown") {
+    return signalToStatus(fallbackColor, fallbackSubtype) || "none";
+  }
+  if (CLINICAL_STATUS_ALIASES[raw]) return CLINICAL_STATUS_ALIASES[raw];
+  if (/resolved|remission|inactive|recovered|healed|cured|disease_free|abatement/.test(raw)) return "healthy";
+  const fromSignal = signalToStatus(fallbackColor, fallbackSubtype);
+  if (fromSignal && fromSignal !== "none") return fromSignal;
+  return "none";
+}
+
+function detectResolvedOutcome(row, normalizedStatus = "") {
+  if (normalizedStatus === "healthy") return true;
+  const statusRaw = String(row?.status || "").toLowerCase();
+  if (/\b(resolved|inactive|remission|recovered|healed|cured|abatement|disease[-_\s]?free)\b/.test(statusRaw)) return true;
+  const txt = `${row?.findings || ""} ${row?.notes || ""}`.toLowerCase();
+  return /(clinical[_\s-]?status\s*[:=]?\s*(resolved|inactive|remission)|\bresolved\b|\brecovered\b|\bhealed\b|\bcured\b|\bremission\b|\bdisease[-\s]?free\b|\bno evidence of disease\b|вылечен|выздоров|ремисси|купирова|без признаков активн)/.test(txt);
+}
+
 function statusToSignal(status) {
   if (status === "sick") return "red";
   if (status === "warning") return "orange";
   if (status === "healthy") return "gray";
   return "gray";
+}
+
+function buildStudyOrganKey(studyType = "", organId = "") {
+  const study = String(studyType || "").trim().toLowerCase();
+  const organ = canonicalizeOrganId(organId || "");
+  return `${study}::${organ}`;
+}
+
+function parseJsonObjectSafe(raw) {
+  if (!raw) return {};
+  if (typeof raw === "object") return raw;
+  try {
+    const parsed = JSON.parse(String(raw));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function extractTimelineMediaRefs(row) {
+  const refs = [];
+  const pushAny = (value) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      value.forEach(pushAny);
+      return;
+    }
+    if (typeof value === "object") {
+      return;
+    }
+    const text = String(value || "").trim();
+    if (!text) return;
+    if ((text.startsWith("[") && text.endsWith("]")) || (text.startsWith("{") && text.endsWith("}"))) {
+      try {
+        const parsed = JSON.parse(text);
+        pushAny(parsed);
+        return;
+      } catch (_) {}
+    }
+    if (/^(none|null|n\/a|na|-|—)$/i.test(text)) return;
+    refs.push(text);
+  };
+
+  pushAny(row?.dicom_refs);
+  const payload = parseJsonObjectSafe(row?.payload);
+  pushAny(payload?.dicom_refs);
+  pushAny(payload?.dicomRefs);
+  pushAny(payload?.image_refs);
+  pushAny(payload?.images);
+  pushAny(payload?.files);
+  if (payload?.affected_organ && typeof payload.affected_organ === "object") {
+    pushAny(payload.affected_organ.dicom_refs);
+    pushAny(payload.affected_organ.dicomRefs);
+    pushAny(payload.affected_organ.image_refs);
+    pushAny(payload.affected_organ.images);
+    pushAny(payload.affected_organ.files);
+  }
+
+  const seen = new Set();
+  const unique = [];
+  refs.forEach(v => {
+    if (!seen.has(v)) {
+      seen.add(v);
+      unique.push(v);
+    }
+  });
+  return unique;
+}
+
+function buildTimelineImageIndexForRows(rows) {
+  const byStudy = new Map();
+  const byOrgan = new Map();
+  (rows || []).forEach(row => {
+    const organ = canonicalizeOrganId(row?.organ_id || "");
+    if (!organ) return;
+    const refs = extractTimelineMediaRefs(row);
+    if (!refs.length) return;
+    byOrgan.set(organ, true);
+    byStudy.set(buildStudyOrganKey(row?.study_type || "", organ), true);
+  });
+  return { byStudy, byOrgan };
+}
+
+function hasTimelineImages(index, organId = "", studyType = "") {
+  const organ = canonicalizeOrganId(organId || "");
+  if (!organ) return false;
+  const byStudy = index?.byStudy;
+  const byOrgan = index?.byOrgan;
+  if (byStudy && byStudy.get(buildStudyOrganKey(studyType, organ))) return true;
+  return !!(byOrgan && byOrgan.get(organ));
 }
 
 function normalizeDiseaseTitle(raw) {
@@ -920,7 +1062,7 @@ function importGitHubDatasetV1(dataset, doctorId = 1) {
         report.skipped++;
         return;
       }
-      const status = String(row?.status || signalToStatus(row?.color, row?.subtype) || "none");
+      const status = normalizeClinicalStatus(row?.status, row?.color, row?.subtype);
       const studyType = String(row?.study_type || row?.source || "imported").trim();
       const studyDateIso = normalizeTimelineDateIso(row?.study_date || row?.date_iso || row?.date, true);
       const studyDate = Number.isNaN(Date.parse(studyDateIso)) ? studyDateIso : new Date(studyDateIso).toLocaleDateString("ru-RU");
@@ -955,8 +1097,13 @@ function importGitHubDatasetV1(dataset, doctorId = 1) {
       latestByOrgan.forEach((row, organId) => {
         let payload = {};
         try { payload = JSON.parse(row.payload || "{}"); } catch (_) {}
-        const statusFromPayload = String(payload?.status || payload?.organ_status || "").trim();
-        const status = statusFromPayload || signalToStatus(row.color, row.subtype);
+        const statusCandidate =
+          payload?.organ_status ||
+          payload?.clinical_status ||
+          payload?.status ||
+          row?.status ||
+          "";
+        const status = normalizeClinicalStatus(statusCandidate, row?.color, row?.subtype);
         const studyDateIso = String(row.date_iso || "");
         const studyDate = Number.isNaN(Date.parse(studyDateIso)) ? studyDateIso : new Date(studyDateIso).toLocaleDateString("ru-RU");
         const findings = String(row.conclusion || payload?.conclusion || "").trim();
@@ -1060,105 +1207,105 @@ const C = {
    ORGAN METADATA
 ═══════════════════════════════════════════════ */
 const OM = {
-  skull:                   { n:"Череп и лицевой отдел",                e:"🦴", g:"bone" },
-  tmj:                     { n:"Височно-нижнечелюстной сустав",        e:"🦴", g:"bone" },
-  hyoid_laryngeal:         { n:"Подъязычная кость и гортань",          e:"🦴", g:"bone" },
-  spine:                   { n:"Позвоночник",                          e:"🦴", g:"bone" },
-  cervical_spine:          { n:"Шейный отдел позвоночника (C1–C7)",    e:"🦴", g:"bone" },
-  thoracic_spine:          { n:"Грудной отдел позвоночника (T1–T12)",  e:"🦴", g:"bone" },
-  lumbar_spine:            { n:"Поясничный отдел позвоночника (L1–L5)",e:"🦴", g:"bone" },
-  sacrum_coccyx:           { n:"Крестец и копчик",                     e:"🦴", g:"bone" },
-  ribcage:                 { n:"Рёбра и грудина",                      e:"🦴", g:"bone" },
-  pelvis:                  { n:"Тазовые кости",                        e:"🦴", g:"bone" },
-  sacroiliac_pubic_joint:  { n:"Крестцово-подвздошный сустав и лобковый симфиз", e:"🔗", g:"bone" },
-  shoulder_girdle:         { n:"Плечевой пояс (ключица и лопатка)",    e:"🦴", g:"bone" },
-  sternoclavicular_joint:  { n:"Грудино-ключичный сустав",             e:"🔗", g:"bone" },
-  acromioclavicular_joint: { n:"Акромиально-ключичный сустав",         e:"🔗", g:"bone" },
-  shoulder_joint:          { n:"Плечевой сустав",                      e:"🔗", g:"bone" },
-  humerus:                 { n:"Плечевая кость",                       e:"🦴", g:"bone" },
-  upper_limb:              { n:"Верхняя конечность",                   e:"🦾", g:"bone" },
-  elbow_joint:             { n:"Локтевой сустав",                      e:"🔗", g:"bone" },
-  forearm_bones:           { n:"Кости предплечья (лучевая и локтевая)",e:"🦴", g:"bone" },
-  wrist_joint:             { n:"Лучезапястный сустав",                 e:"🔗", g:"bone" },
-  wrist_hand:              { n:"Кости кисти и запястья",               e:"✋", g:"bone" },
-  hand_bones:              { n:"Кости кисти (пястные и фаланги)",      e:"✋", g:"bone" },
-  hand_joints:             { n:"Суставы кисти",                        e:"🔗", g:"bone" },
-  femur:                   { n:"Бедренная кость",                      e:"🦴", g:"bone" },
-  tibia_fibula:            { n:"Большеберцовая и малоберцовая кости",  e:"🦴", g:"bone" },
-  hip_joint:               { n:"Тазобедренный сустав",                 e:"🔗", g:"bone" },
-  knee_joint:              { n:"Коленный сустав",                      e:"🔗", g:"bone" },
-  ankle_joint:             { n:"Голеностопный сустав",                 e:"🔗", g:"bone" },
-  ankle_foot:              { n:"Голеностоп и кости стопы",             e:"🦶", g:"bone" },
-  foot_bones:              { n:"Кости стопы",                          e:"🦶", g:"bone" },
-  foot_joints:             { n:"Суставы стопы",                        e:"🔗", g:"bone" },
+  skull:                   { n:"Череп и лицевой отдел",                e:"", g:"bone" },
+  tmj:                     { n:"Височно-нижнечелюстной сустав",        e:"", g:"bone" },
+  hyoid_laryngeal:         { n:"Подъязычная кость и гортань",          e:"", g:"bone" },
+  spine:                   { n:"Позвоночник",                          e:"", g:"bone" },
+  cervical_spine:          { n:"Шейный отдел позвоночника (C1–C7)",    e:"", g:"bone" },
+  thoracic_spine:          { n:"Грудной отдел позвоночника (T1–T12)",  e:"", g:"bone" },
+  lumbar_spine:            { n:"Поясничный отдел позвоночника (L1–L5)",e:"", g:"bone" },
+  sacrum_coccyx:           { n:"Крестец и копчик",                     e:"", g:"bone" },
+  ribcage:                 { n:"Рёбра и грудина",                      e:"", g:"bone" },
+  pelvis:                  { n:"Тазовые кости",                        e:"", g:"bone" },
+  sacroiliac_pubic_joint:  { n:"Крестцово-подвздошный сустав и лобковый симфиз", e:"", g:"bone" },
+  shoulder_girdle:         { n:"Плечевой пояс (ключица и лопатка)",    e:"", g:"bone" },
+  sternoclavicular_joint:  { n:"Грудино-ключичный сустав",             e:"", g:"bone" },
+  acromioclavicular_joint: { n:"Акромиально-ключичный сустав",         e:"", g:"bone" },
+  shoulder_joint:          { n:"Плечевой сустав",                      e:"", g:"bone" },
+  humerus:                 { n:"Плечевая кость",                       e:"", g:"bone" },
+  upper_limb:              { n:"Верхняя конечность",                   e:"", g:"bone" },
+  elbow_joint:             { n:"Локтевой сустав",                      e:"", g:"bone" },
+  forearm_bones:           { n:"Кости предплечья (лучевая и локтевая)",e:"", g:"bone" },
+  wrist_joint:             { n:"Лучезапястный сустав",                 e:"", g:"bone" },
+  wrist_hand:              { n:"Кости кисти и запястья",               e:"", g:"bone" },
+  hand_bones:              { n:"Кости кисти (пястные и фаланги)",      e:"", g:"bone" },
+  hand_joints:             { n:"Суставы кисти",                        e:"", g:"bone" },
+  femur:                   { n:"Бедренная кость",                      e:"", g:"bone" },
+  tibia_fibula:            { n:"Большеберцовая и малоберцовая кости",  e:"", g:"bone" },
+  hip_joint:               { n:"Тазобедренный сустав",                 e:"", g:"bone" },
+  knee_joint:              { n:"Коленный сустав",                      e:"", g:"bone" },
+  ankle_joint:             { n:"Голеностопный сустав",                 e:"", g:"bone" },
+  ankle_foot:              { n:"Голеностоп и кости стопы",             e:"", g:"bone" },
+  foot_bones:              { n:"Кости стопы",                          e:"", g:"bone" },
+  foot_joints:             { n:"Суставы стопы",                        e:"", g:"bone" },
 
-  brain:                   { n:"Головной мозг",                        e:"🧠", g:"neuro" },
-  spinal_cord:             { n:"Спинной мозг",                         e:"⚡", g:"neuro" },
-  meninges:                { n:"Мозговые оболочки",                    e:"🧠", g:"neuro" },
-  peripheral_nerves:       { n:"Периферические нервы",                 e:"⚡", g:"neuro" },
+  brain:                   { n:"Головной мозг",                        e:"", g:"neuro" },
+  spinal_cord:             { n:"Спинной мозг",                         e:"", g:"neuro" },
+  meninges:                { n:"Мозговые оболочки",                    e:"", g:"neuro" },
+  peripheral_nerves:       { n:"Периферические нервы",                 e:"", g:"neuro" },
 
-  thyroid:                 { n:"Щитовидная железа",                    e:"🔵", g:"endo" },
-  parathyroid:             { n:"Паращитовидные железы",                e:"🟣", g:"endo" },
+  thyroid:                 { n:"Щитовидная железа",                    e:"", g:"endo" },
+  parathyroid:             { n:"Паращитовидные железы",                e:"", g:"endo" },
 
-  heart:                   { n:"Сердце",                               e:"❤️", g:"cardio" },
-  coronary_vessels:        { n:"Коронарные сосуды",                    e:"🩸", g:"cardio" },
-  aorta:                   { n:"Аорта",                                e:"🩸", g:"cardio" },
-  pulmonary_vessels:       { n:"Лёгочные сосуды",                      e:"🩸", g:"cardio" },
-  carotid_vessels:         { n:"Сосуды головы и шеи",                  e:"🩸", g:"cardio" },
-  cerebral_vessels:        { n:"Сосуды головного мозга",               e:"🩸", g:"cardio" },
-  upper_limb_vessels:      { n:"Сосуды верхних конечностей",           e:"🩸", g:"cardio" },
-  lower_limb_vessels:      { n:"Сосуды нижних конечностей",            e:"🩸", g:"cardio" },
+  heart:                   { n:"Сердце",                               e:"", g:"cardio" },
+  coronary_vessels:        { n:"Коронарные сосуды",                    e:"", g:"cardio" },
+  aorta:                   { n:"Аорта",                                e:"", g:"cardio" },
+  pulmonary_vessels:       { n:"Лёгочные сосуды",                      e:"", g:"cardio" },
+  carotid_vessels:         { n:"Сосуды головы и шеи",                  e:"", g:"cardio" },
+  cerebral_vessels:        { n:"Сосуды головного мозга",               e:"", g:"cardio" },
+  upper_limb_vessels:      { n:"Сосуды верхних конечностей",           e:"", g:"cardio" },
+  lower_limb_vessels:      { n:"Сосуды нижних конечностей",            e:"", g:"cardio" },
 
-  lung_left:               { n:"Левое лёгкое",                         e:"🫁", g:"pulmo" },
-  lung_right:              { n:"Правое лёгкое",                        e:"🫁", g:"pulmo" },
-  trachea:                 { n:"Трахея и крупные бронхи",              e:"🫁", g:"pulmo" },
+  lung_left:               { n:"Левое лёгкое",                         e:"", g:"pulmo" },
+  lung_right:              { n:"Правое лёгкое",                        e:"", g:"pulmo" },
+  trachea:                 { n:"Трахея и крупные бронхи",              e:"", g:"pulmo" },
 
-  salivary_glands:         { n:"Слюнные железы",                       e:"💧", g:"gastro" },
-  tonsils:                 { n:"Нёбные миндалины",                     e:"🫧", g:"lymph" },
-  tongue:                  { n:"Язык",                                 e:"👅", g:"gastro" },
-  esophagus:               { n:"Пищевод",                              e:"〰️", g:"gastro" },
+  salivary_glands:         { n:"Слюнные железы",                       e:"", g:"gastro" },
+  tonsils:                 { n:"Нёбные миндалины",                     e:"", g:"lymph" },
+  tongue:                  { n:"Язык",                                 e:"", g:"gastro" },
+  esophagus:               { n:"Пищевод",                              e:"〰", g:"gastro" },
   stomach:                 { n:"Желудок",                              e:"⭕", g:"gastro" },
-  small_intestine:         { n:"Тонкая кишка",                         e:"〰️", g:"gastro" },
-  large_intestine:         { n:"Толстая кишка",                        e:"🔄", g:"gastro" },
-  liver:                   { n:"Печень",                               e:"🟤", g:"gastro" },
-  gallbladder:             { n:"Жёлчный пузырь",                       e:"🟡", g:"gastro" },
-  pancreas:                { n:"Поджелудочная железа",                 e:"🔺", g:"gastro" },
-  spleen:                  { n:"Селезёнка",                            e:"🔮", g:"gastro" },
+  small_intestine:         { n:"Тонкая кишка",                         e:"〰", g:"gastro" },
+  large_intestine:         { n:"Толстая кишка",                        e:"", g:"gastro" },
+  liver:                   { n:"Печень",                               e:"", g:"gastro" },
+  gallbladder:             { n:"Жёлчный пузырь",                       e:"", g:"gastro" },
+  pancreas:                { n:"Поджелудочная железа",                 e:"", g:"gastro" },
+  spleen:                  { n:"Селезёнка",                            e:"", g:"gastro" },
 
-  kidney_left:             { n:"Левая почка",                          e:"🫘", g:"uro" },
-  kidney_right:            { n:"Правая почка",                         e:"🫘", g:"uro" },
-  bladder:                 { n:"Мочевой пузырь",                       e:"💧", g:"uro" },
+  kidney_left:             { n:"Левая почка",                          e:"", g:"uro" },
+  kidney_right:            { n:"Правая почка",                         e:"", g:"uro" },
+  bladder:                 { n:"Мочевой пузырь",                       e:"", g:"uro" },
   prostate:                { n:"Предстательная железа",                e:"⬜", g:"uro" },
-  testis_left:             { n:"Левое яичко",                          e:"♂️", g:"repro" },
-  testis_right:            { n:"Правое яичко",                         e:"♂️", g:"repro" },
-  penis:                   { n:"Половой член",                         e:"♂️", g:"repro" },
-  seminal_vesicles:        { n:"Семенные пузырьки и семявыносящие пути", e:"♂️", g:"repro" },
+  testis_left:             { n:"Левое яичко",                          e:"", g:"repro" },
+  testis_right:            { n:"Правое яичко",                         e:"", g:"repro" },
+  penis:                   { n:"Половой член",                         e:"", g:"repro" },
+  seminal_vesicles:        { n:"Семенные пузырьки и семявыносящие пути", e:"", g:"repro" },
 
-  uterus:                  { n:"Матка",                                e:"♀️", g:"repro" },
-  ovary_left:              { n:"Левый яичник",                         e:"♀️", g:"repro" },
-  ovary_right:             { n:"Правый яичник",                        e:"♀️", g:"repro" },
+  uterus:                  { n:"Матка",                                e:"", g:"repro" },
+  ovary_left:              { n:"Левый яичник",                         e:"", g:"repro" },
+  ovary_right:             { n:"Правый яичник",                        e:"", g:"repro" },
 
-  thymus:                  { n:"Тимус",                                e:"🫧", g:"lymph" },
-  lymph_nodes_head_neck:   { n:"Лимфоузлы головы и шеи",               e:"🫧", g:"lymph" },
-  lymph_nodes_thoracic:    { n:"Грудные лимфоузлы",                    e:"🫧", g:"lymph" },
-  lymph_nodes_abdominal:   { n:"Брюшные лимфоузлы",                    e:"🫧", g:"lymph" },
-  lymph_nodes_pelvic:      { n:"Тазовые лимфоузлы",                    e:"🫧", g:"lymph" },
-  lymph_nodes_upper_limb:  { n:"Лимфоузлы верхних конечностей",        e:"🫧", g:"lymph" },
-  lymph_nodes_lower_limb:  { n:"Лимфоузлы нижних конечностей",         e:"🫧", g:"lymph" },
+  thymus:                  { n:"Тимус",                                e:"", g:"lymph" },
+  lymph_nodes_head_neck:   { n:"Лимфоузлы головы и шеи",               e:"", g:"lymph" },
+  lymph_nodes_thoracic:    { n:"Грудные лимфоузлы",                    e:"", g:"lymph" },
+  lymph_nodes_abdominal:   { n:"Брюшные лимфоузлы",                    e:"", g:"lymph" },
+  lymph_nodes_pelvic:      { n:"Тазовые лимфоузлы",                    e:"", g:"lymph" },
+  lymph_nodes_upper_limb:  { n:"Лимфоузлы верхних конечностей",        e:"", g:"lymph" },
+  lymph_nodes_lower_limb:  { n:"Лимфоузлы нижних конечностей",         e:"", g:"lymph" },
 
-  head_neck_muscles:       { n:"Мышцы головы и шеи",                   e:"💪", g:"muscle" },
-  torso_muscles:           { n:"Мышцы туловища",                       e:"💪", g:"muscle" },
-  upper_limb_muscles:      { n:"Мышцы верхних конечностей",            e:"💪", g:"muscle" },
-  lower_limb_muscles:      { n:"Мышцы нижних конечностей",             e:"💪", g:"muscle" },
+  head_neck_muscles:       { n:"Мышцы головы и шеи",                   e:"", g:"muscle" },
+  torso_muscles:           { n:"Мышцы туловища",                       e:"", g:"muscle" },
+  upper_limb_muscles:      { n:"Мышцы верхних конечностей",            e:"", g:"muscle" },
+  lower_limb_muscles:      { n:"Мышцы нижних конечностей",             e:"", g:"muscle" },
 
-  skin_head_neck:          { n:"Кожа головы и шеи",                    e:"🧍", g:"skin" },
-  skin_torso:              { n:"Кожа туловища",                        e:"🧍", g:"skin" },
-  skin_upper_limb:         { n:"Кожа верхних конечностей",             e:"🧍", g:"skin" },
-  skin_lower_limb:         { n:"Кожа нижних конечностей",              e:"🧍", g:"skin" },
+  skin_head_neck:          { n:"Кожа головы и шеи",                    e:"", g:"skin" },
+  skin_torso:              { n:"Кожа туловища",                        e:"", g:"skin" },
+  skin_upper_limb:         { n:"Кожа верхних конечностей",             e:"", g:"skin" },
+  skin_lower_limb:         { n:"Кожа нижних конечностей",              e:"", g:"skin" },
 
   // legacy aliases for old AI / DB records
-  lymph_nodes_cervical:    { n:"Лимфоузлы головы и шеи",               e:"🫧", g:"lymph" },
-  lymph_nodes_inguinal:    { n:"Лимфоузлы нижних конечностей",         e:"🫧", g:"lymph" },
+  lymph_nodes_cervical:    { n:"Лимфоузлы головы и шеи",               e:"", g:"lymph" },
+  lymph_nodes_inguinal:    { n:"Лимфоузлы нижних конечностей",         e:"", g:"lymph" },
 };
 
 const ORGAN_ID_ALIASES = {
@@ -1244,6 +1391,32 @@ function normalizeMeshName(raw) {
   if (hasLeft && !/\bleft\b/.test(lower)) lower = `${lower} left`.trim();
   if (hasRight && !/\bright\b/.test(lower)) lower = `${lower} right`.trim();
   return lower;
+}
+
+const HEAD_PRIORITY_BLOCK_ORGANS = new Set([
+  "brain",
+  "skull",
+  "meninges",
+  "tmj",
+  "head_neck_muscles",
+  "skin_head_neck",
+  "cerebral_vessels",
+  "carotid_vessels",
+  "salivary_glands",
+  "tonsils",
+  "tongue",
+  "lymph_nodes_head_neck",
+  "hyoid_laryngeal",
+]);
+
+function isHeadRegionMesh(meshName, cat = "", organId = "") {
+  const oid = canonicalizeOrganId(organId || "");
+  if (oid && HEAD_PRIORITY_BLOCK_ORGANS.has(oid)) return true;
+  const n = normalizeMeshName(meshName || "");
+  if (!n) return false;
+  if (/\b(head|cranial|cranium|skull|brain|cerebr|cerebell|orbital|orbit|ocular|ophthalm|eye|nasal|sinus|ethmoid|frontal|parietal|temporal|occipital|maxilla|mandible|jaw|zygoma|hyoid|olfactory|facial|auricular|ear|tonsil|tongue)\b/.test(n)) return true;
+  if (cat === "nervous" && /\b(ventricle|gyrus|sulcus|insula|thalam|hippoc|amygdal|pons|medulla)\b/.test(n)) return true;
+  return false;
 }
 
 function prettyMeshLabel(raw) {
@@ -1605,15 +1778,66 @@ function canonicalizeOrganMap(map) {
 
 /* ═══ Слои модели: каждый .glb-файл из папки 3d — отдельный слой ═══ */
 const TARGET_GROUPS = [
-  { name: "outerlayer",     path: "3d/Outerlayer.glb",     ru: "Наружный слой",                 icon: "🧍", defaultOn: true,  category: "skin" },
-  { name: "muscular",       path: "3d/Muscular.glb",       ru: "Мышечная система",              icon: "💪", defaultOn: true,  category: "muscular" },
-  { name: "skeletal",       path: "3d/Skeletal.glb",       ru: "Костная система",               icon: "🦴", defaultOn: true,  category: "skeletal" },
-  { name: "joints",         path: "3d/Joints.glb",         ru: "Суставы",                       icon: "🔗", defaultOn: true,  category: "joints" },
-  { name: "cardiovascular", path: "3d/Cardiovascular.glb", ru: "Сердечно-сосудистая система",   icon: "❤️", defaultOn: true,  category: "cardiovascular" },
-  { name: "lymphoid",       path: "3d/Lymphoid.glb",       ru: "Лимфоидная система",            icon: "🫧", defaultOn: true,  category: "lymphoid" },
-  { name: "nervous",        path: "3d/Nervous.glb",        ru: "Нервная система",               icon: "⚡", defaultOn: true,  category: "nervous" },
-  { name: "visceral",       path: "3d/Visceral.glb",       ru: "Внутренние органы",             icon: "🫀", defaultOn: true,  category: "visceral" },
+  { name: "outerlayer",     path: "3d/Outerlayer.glb",     ru: "Наружный слой",                 icon: "", defaultOn: true,  category: "skin" },
+  { name: "muscular",       path: "3d/Muscular.glb",       ru: "Мышечная система",              icon: "", defaultOn: true,  category: "muscular" },
+  { name: "skeletal",       path: "3d/Skeletal.glb",       ru: "Костная система",               icon: "", defaultOn: true,  category: "skeletal" },
+  { name: "joints",         path: "3d/Joints.glb",         ru: "Суставы",                       icon: "", defaultOn: true,  category: "joints" },
+  { name: "cardiovascular", path: "3d/Cardiovascular.glb", ru: "Сердечно-сосудистая система",   icon: "", defaultOn: true,  category: "cardiovascular" },
+  { name: "lymphoid",       path: "3d/Lymphoid.glb",       ru: "Лимфоидная система",            icon: "", defaultOn: true,  category: "lymphoid" },
+  { name: "nervous",        path: "3d/Nervous.glb",        ru: "Нервная система",               icon: "", defaultOn: true,  category: "nervous" },
+  { name: "visceral",       path: "3d/Visceral.glb",       ru: "Внутренние органы",             icon: "", defaultOn: true,  category: "visceral" },
 ];
+
+const ORGAN_GROUP_FOCUS_MAP = {
+  cardio: ["cardiovascular"],
+  pulmo: ["visceral", "cardiovascular"],
+  gastro: ["visceral"],
+  uro: ["visceral"],
+  repro: ["visceral"],
+  endo: ["visceral"],
+  neuro: ["nervous"],
+  bone: ["skeletal", "joints"],
+  muscle: ["muscular"],
+  skin: ["outerlayer"],
+  lymph: ["lymphoid"],
+};
+
+function buildAutoGroupVisibilityForRows(rows) {
+  const vis = {};
+  TARGET_GROUPS.forEach(g => { vis[g.name] = false; });
+  // External layer must always be visible for any patient.
+  vis.outerlayer = true;
+  const mark = (name) => {
+    if (Object.prototype.hasOwnProperty.call(vis, name)) vis[name] = true;
+  };
+
+  (rows || []).forEach(row => {
+    const st = String(row?.status || "none");
+    if (st !== "sick" && st !== "warning") return;
+    const oid = canonicalizeOrganId(row?.organ_id || row?.organid || "");
+    const organGroup = OM[oid]?.g;
+    (ORGAN_GROUP_FOCUS_MAP[organGroup] || []).forEach(mark);
+
+    // Fallbacks for less precise organ ids.
+    if (/heart|aorta|coronary|carotid|cerebral|vessels/.test(oid)) mark("cardiovascular");
+    if (/^lung_|^trachea$|pulmonary/.test(oid)) {
+      mark("visceral");
+      mark("cardiovascular");
+    }
+    if (/lymph|tonsils|thymus/.test(oid)) mark("lymphoid");
+  });
+
+  return vis;
+}
+
+function normalizeGroupVisibility(raw, fallback = false) {
+  const next = {};
+  TARGET_GROUPS.forEach(g => {
+    if (raw && raw[g.name] !== undefined) next[g.name] = raw[g.name] === true;
+    else next[g.name] = !!fallback;
+  });
+  return next;
+}
 
 
 /* ═══ Global model cache — по отдельному кэшу на каждый файл ═══ */
@@ -1987,9 +2211,24 @@ function inferStatusFromConclusionText(text) {
   const t = src.toLowerCase();
   const hasNegation = /(no evidence of|without evidence|negative for|rule(?:d)? out|excluded|without|нет признаков|без признаков|исключ(?:ено|ён|ена)|не выявлено)/i.test(src);
   if (hasNegation) return "healthy";
+  if (/clinical[_\s-]?status\s*[:=]\s*resolved|\bresolved\b/i.test(t)) return "healthy";
+  if (/clinical[_\s-]?status\s*[:=]\s*(inactive|remission)|\bremission\b|\binactive\b/i.test(t)) return "warning";
   if (/malignant neoplasm|carcinoma|adenocarcinoma|sarcoma|lymphoma|leukemia|cancer|рак|карцинома|злокачеств/i.test(t)) return "sick";
+  if (/\(person\)|\bperson\b/i.test(src)) return "healthy";
+  if (/\(procedure\)|\bprocedure\b/i.test(src)) {
+    if (/(complication|adverse|hemorrhag|bleed|perforat|infection|sepsis|shock|acute|injury|trauma|fracture|dislocation|iatrogenic|post[-\s]?op)/i.test(t)) return "sick";
+    return "warning";
+  }
+  if (/\(situation\)|\bsituation\b/i.test(src)) {
+    if (/(acute|severe|critical|decompensat|shock|sepsis|bleed|embol|stroke|infarct|respiratory failure|renal failure|hepatic failure)/i.test(t)) return "sick";
+    return "warning";
+  }
   if (/\(disorder\)|\bdisorder\b/i.test(src)) return "sick";
-  if (/\(finding\)|\bfinding\b/i.test(src)) return "warning";
+  if (/\(morphologic(?:al)? abnormality\)|\bmorphologic(?:al)?\s+abnormalit(?:y|ies)\b|морфологическ[а-яё]+\s+аномал[а-яё]+/i.test(src)) return "sick";
+  if (/\(finding\)|\bfinding\b/i.test(src)) {
+    if (/\bnormal\b|within normal|no abnormal|unremarkable|without significant findings|норма|без патологии/i.test(t)) return "healthy";
+    return "warning";
+  }
   if (/(acute|остр[а-я]+)\s+(infar|stroke|sepsis|failure|bleed|fracture|bronchitis|pneumonia|панкреатит|инфаркт|инсульт|сепсис|недостаточност|кровотеч|перелом|пневмон)/i.test(t)) return "sick";
   return "none";
 }
@@ -2002,8 +2241,8 @@ function inferMajorOrganIdFromMeshName(meshName, cat="visceral") {
   const right = /\bright\b/.test(n) || /(?:\.r\b|\bright\b)/.test(raw.toLowerCase());
   const has = (re) => re.test(n);
 
-  // Global heart fallback: some heart meshes are not classified as cardiovascular by name.
-  if (has(/\bheart\b|atrium|ventricle|pericard|myocard|endocard|epicard|atrioventricular|mitral|tricuspid|papillary|trabeculae|chordae/)) {
+  // Global heart fallback: keep it strict to avoid false matches (e.g. brain ventricles).
+  if (has(/\bheart\b|\bcardiac\b|coronary|pericard|myocard|endocard|epicard|atrioventricular|mitral|tricuspid|aortic valve|pulmonary valve|papillary muscle|chordae tendineae/)) {
     return "heart";
   }
 
@@ -2070,6 +2309,7 @@ function inferMajorOrganIdFromMeshName(meshName, cat="visceral") {
     if (has(/tentorium|falx|dura|arachnoid|pia/)) return has(/spinal/) ? "spinal_cord" : "meninges";
     if (has(/spinal|cauda equina|nerve root/)) return "spinal_cord";
     if (has(/nerve|plexus|ganglion|radicular/)) return "peripheral_nerves";
+    if (has(/ventricle|ventricular|cerebral aqueduct|foramen of monro|third ventricle|fourth ventricle/)) return "brain";
     if (has(/brain|cerebr|cerebel|gyrus|sulcus|insula|thalam|amygdal|hippoc|brainstem|pons|medulla|choroid plexus|olfactory|lobule|temporal pole|occipital pole/)) return "brain";
     return null;
   }
@@ -2224,7 +2464,7 @@ function NLPInsightBadge({ results, isAnalyzing }) {
   return (
     <div style={{marginTop:7,padding:"8px 10px",borderRadius:9,background:"rgba(3,194,252,0.05)",border:"1px solid rgba(3,194,252,0.15)"}}>
       <div style={{fontSize:8,fontWeight:700,color:"#03C2FC",letterSpacing:"0.07em",marginBottom:6,textTransform:"uppercase"}}>
-        🔍 Автодиагностика по тексту
+         Автодиагностика по тексту
         <span style={{color:C.muted,fontWeight:400,marginLeft:6,textTransform:"none",fontSize:8}}>Gemini/правила</span>
       </div>
       <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
@@ -2239,7 +2479,7 @@ function NLPInsightBadge({ results, isAnalyzing }) {
       </div>
       {results.length > 0 && (
         <div style={{fontSize:8,color:C.muted,marginTop:5,fontStyle:"italic"}}>
-          💡 Органы на модели подсвечены по результатам анализа. Финальный диагноз — за врачом.
+           Органы на модели подсвечены по результатам анализа. Финальный диагноз — за врачом.
         </div>
       )}
     </div>
@@ -3428,7 +3668,7 @@ function BodyModel3D({
   }
 
   // ── 2) Видимость + материалы каждого меша ─────────────────────────────
-  Object.values(meshesRef.current).forEach(({ mesh, cat }) => {
+  Object.values(meshesRef.current).forEach(({ mesh, cat, organId }) => {
     // Effective visibility: group toggle AND category toggle
     let visible = (lv && lv[cat] !== false);
 
@@ -3448,19 +3688,30 @@ function BodyModel3D({
 
     // ── Skip if nothing changed (visibility + xray + selection + status) ─
     const clinicalEntry = getMeshClinicalEntry(mesh.name, cat, od2);
-    const stNow = clinicalEntry ? (clinicalEntry._nlpUpgrade || clinicalEntry.status || "") : "";
-    const _sig = `${mesh.visible?1:0}|${xr?1:0}|${sel2===mesh.name?1:0}|${hov2===mesh.name?1:0}|${stNow}`;
+    const timelineMeta = clinicalEntry?._timeline || null;
+    const stNow = clinicalEntry
+      ? (timelineMeta?.displayStatus || clinicalEntry._nlpUpgrade || clinicalEntry.status || "")
+      : "";
+    const outlineOnly = !!timelineMeta?.outlineOnly && (stNow === "sick" || stNow === "warning");
+    const outlineSignal = String(timelineMeta?.outlineSignal || "");
+    const signalStatusMap = { red: "sick", orange: "warning", yellow: "warning", blue: "none", gray: "none" };
+    const outlineHex = STATUS_HEX[signalStatusMap[outlineSignal] || stNow] ?? STATUS_HEX.none;
+    const mappedOrganId = clinicalEntry?.organ_id || organId || "";
+    const headRegion = isHeadRegionMesh(mesh.name, cat, mappedOrganId);
+    const _sig = `${mesh.visible?1:0}|${xr?1:0}|${sel2===mesh.name?1:0}|${hov2===mesh.name?1:0}|${stNow}|${outlineOnly?1:0}|${outlineSignal}`;
     const isSel = sel2 === mesh.name;
     const isHover = hov2 === mesh.name;
     const isFocus = isSel || isHover;
 
-    const setMat = (mat, hex, opacity, depthWrite) => {
+    const setMat = (mat, hex, opacity, depthWrite, depthTest = true, wireframe = false) => {
       if (!mat) return;
       if (mat.color) mat.color.setHex(hex);
       const op = Math.max(0, Math.min(1, opacity));
       mat.opacity = op;
       mat.transparent = op < 1;
       mat.depthWrite = (depthWrite !== undefined) ? depthWrite : (op >= 1);
+      mat.depthTest = !!depthTest;
+      mat.wireframe = !!wireframe;
       if (mat.emissive) mat.emissive.setHex(isSel ? 0x0a2040 : isHover ? 0x06345a : 0x000000);
       mat.needsUpdate = true;
     };
@@ -3479,18 +3730,39 @@ if (xr) {
   };
   const xp = xrayPalette[cat] || xrayPalette.visceral;
   const isCriticalStatus = stNow === "sick" || stNow === "warning";
+  const criticalRankXray = headRegion ? 0 : (stNow === "sick" ? 2 : stNow === "warning" ? 1 : 0);
+  mesh.renderOrder = isSel ? 220 : isHover ? 210 : criticalRankXray === 2 ? 200 : criticalRankXray === 1 ? 180 : 0;
   if (stNow && stNow !== "none") {
-    const xrayStatusOpacity = isCriticalStatus
-      ? (isFocus ? 0.74 : 0.58)
-      : (isFocus ? 0.48 : 0.34);
+    const xrayStatusOpacity = outlineOnly
+      ? (isFocus ? 0.96 : 0.88)
+      : isCriticalStatus
+        ? (isFocus ? 0.74 : 0.58)
+        : (isFocus ? 0.48 : 0.34);
+    const forceOnTop = isCriticalStatus && !headRegion;
     mats.forEach(mat => {
-      setMat(mat, STATUS_HEX[stNow] ?? STATUS_HEX.none, xrayStatusOpacity, false);
+      setMat(
+        mat,
+        outlineOnly ? outlineHex : (STATUS_HEX[stNow] ?? STATUS_HEX.none),
+        xrayStatusOpacity,
+        false,
+        !forceOnTop,
+        outlineOnly
+      );
+      if (mat) {
+        mat.polygonOffset = forceOnTop;
+        mat.polygonOffsetFactor = forceOnTop ? -2 : 0;
+        mat.polygonOffsetUnits = forceOnTop ? -2 : 0;
+      }
       if (mat && mat.emissive) {
-        mat.emissive.setHex(
-          stNow === "sick" ? 0x2b0a10 :
-          stNow === "warning" ? 0x332009 :
-          stNow === "healthy" ? 0x0a2b18 : 0x000000
-        );
+        if (outlineOnly) {
+          mat.emissive.setHex(stNow === "sick" ? 0x3a0d14 : 0x3a2308);
+        } else {
+          mat.emissive.setHex(
+            stNow === "sick" ? 0x2b0a10 :
+            stNow === "warning" ? 0x332009 :
+            stNow === "healthy" ? 0x0a2b18 : 0x000000
+          );
+        }
       }
     });
   } else {
@@ -3500,6 +3772,11 @@ if (xr) {
       mat.opacity = critOnly ? 0 : Math.max(0.02, xp.op * xp.factor);
       mat.transparent = true;
       mat.depthWrite = false;
+      mat.depthTest = true;
+      mat.wireframe = false;
+      mat.polygonOffset = false;
+      mat.polygonOffsetFactor = 0;
+      mat.polygonOffsetUnits = 0;
       if (mat.emissive) mat.emissive.setHex(critOnly ? 0x000000 : (isSel ? 0x004466 : isHover ? 0x036280 : 0x001a33));
       mat.needsUpdate = true;
     });
@@ -3510,6 +3787,11 @@ if (xr) {
       mat.opacity = 0;
       mat.transparent = true;
       mat.depthWrite = false;
+      mat.depthTest = false;
+      mat.wireframe = false;
+      mat.polygonOffset = false;
+      mat.polygonOffsetFactor = 0;
+      mat.polygonOffsetUnits = 0;
       if (mat.emissive) mat.emissive.setHex(0x000000);
       mat.needsUpdate = true;
     });
@@ -3518,31 +3800,47 @@ if (xr) {
 }
 
 // ── Normal mode ────────────────────────────────────────────────────
+const od3  = clinicalEntry;
+const st   = od3?.status || "none";
+// Use the same effective status as hover cards/xray to avoid label-color mismatch.
+const disp = od3?._timeline?.displayStatus || od3?._nlpUpgrade || st;
+const outlineOnlyNormal = !!od3?._timeline?.outlineOnly && (disp === "sick" || disp === "warning");
+const outlineSignalNormal = String(od3?._timeline?.outlineSignal || "");
+const signalStatusMapNormal = { red: "sick", orange: "warning", yellow: "warning", blue: "none", gray: "none" };
+const normalOutlineHex = STATUS_HEX[signalStatusMapNormal[outlineSignalNormal] || disp] ?? STATUS_HEX.none;
+
+const normalOpacity = {
+  skeletal:       { active: isFocus ? 0.48 : 0.34, none: isFocus ? 0.22 : 0.12, depthWrite: true  },
+  joints:         { active: isFocus ? 0.44 : 0.28, none: isFocus ? 0.20 : 0.11, depthWrite: false },
+  muscular:       { active: isFocus ? 0.11 : 0.045,none: isFocus ? 0.07 : 0.03, depthWrite: false },
+  cardiovascular: { active: isFocus ? 0.43 : 0.27, none: isFocus ? 0.18 : 0.10, depthWrite: false },
+  lymphoid:       { active: isFocus ? 0.41 : 0.24, none: isFocus ? 0.18 : 0.10, depthWrite: false },
+  nervous:        { active: isFocus ? 0.44 : 0.30, none: isFocus ? 0.19 : 0.11, depthWrite: false },
+  skin:           { active: isFocus ? 0.22 : 0.09, none: isFocus ? 0.14 : 0.06, depthWrite: false },
+  visceral:       { active: isFocus ? 0.44 : 0.34, none: isFocus ? 0.20 : 0.13, depthWrite: false },
+};
+const np = normalOpacity[cat] || normalOpacity.visceral;
+const hex = outlineOnlyNormal ? normalOutlineHex : (STATUS_HEX[disp] ?? STATUS_HEX.none);
+const isCriticalStatus = disp === "sick" || disp === "warning";
+const opacity = critOnly
+  ? (isCriticalStatus ? (outlineOnlyNormal ? (isFocus ? 0.96 : 0.88) : np.active) : 0)
+  : (disp === "none" ? np.none : (outlineOnlyNormal ? (isFocus ? 0.93 : 0.84) : np.active));
+const criticalRankNormal = headRegion ? 0 : (disp === "sick" ? 2 : disp === "warning" ? 1 : 0);
+mesh.renderOrder = isSel ? 220 : isHover ? 210 : criticalRankNormal === 2 ? 200 : criticalRankNormal === 1 ? 180 : 0;
+const forceOnTop = isCriticalStatus && opacity > 0 && !headRegion;
 mats.forEach(mat => {
   if (!mat) return;
-
-  const od3  = clinicalEntry;
-  const st   = od3?.status || "none";
-  // Use the same effective status as hover cards/xray to avoid label-color mismatch.
-  const disp = od3?._nlpUpgrade || st;
-
-  const normalOpacity = {
-    skeletal:       { active: isFocus ? 0.48 : 0.34, none: isFocus ? 0.22 : 0.12, depthWrite: true  },
-    joints:         { active: isFocus ? 0.44 : 0.28, none: isFocus ? 0.20 : 0.11, depthWrite: false },
-    muscular:       { active: isFocus ? 0.11 : 0.045,none: isFocus ? 0.07 : 0.03, depthWrite: false },
-    cardiovascular: { active: isFocus ? 0.43 : 0.27, none: isFocus ? 0.18 : 0.10, depthWrite: false },
-    lymphoid:       { active: isFocus ? 0.41 : 0.24, none: isFocus ? 0.18 : 0.10, depthWrite: false },
-    nervous:        { active: isFocus ? 0.44 : 0.30, none: isFocus ? 0.19 : 0.11, depthWrite: false },
-    skin:           { active: isFocus ? 0.22 : 0.09, none: isFocus ? 0.14 : 0.06, depthWrite: false },
-    visceral:       { active: isFocus ? 0.44 : 0.34, none: isFocus ? 0.20 : 0.13, depthWrite: false },
-  };
-  const np = normalOpacity[cat] || normalOpacity.visceral;
-  const hex = STATUS_HEX[disp] ?? STATUS_HEX.none;
-  const isCriticalStatus = disp === "sick" || disp === "warning";
-  const opacity = critOnly
-    ? (isCriticalStatus ? np.active : 0)
-    : (disp === "none" ? np.none : np.active);
-  setMat(mat, hex, opacity, np.depthWrite);
+  setMat(
+    mat,
+    hex,
+    opacity,
+    outlineOnlyNormal ? false : (forceOnTop ? false : np.depthWrite),
+    !forceOnTop,
+    outlineOnlyNormal
+  );
+  mat.polygonOffset = forceOnTop;
+  mat.polygonOffsetFactor = forceOnTop ? -2 : 0;
+  mat.polygonOffsetUnits = forceOnTop ? -2 : 0;
 });
   });
   visibleMeshesRef.current = Object.values(meshesRef.current)
@@ -3573,7 +3871,7 @@ mats.forEach(mat => {
         'typeof THREE === "undefined"'
       );
     }
-    addLog('✓ THREE r' + THREE.REVISION, 'ok');
+    addLog(' THREE r' + THREE.REVISION, 'ok');
 
     // ── Step 2: WebGL support ──
     addLog('Проверка WebGL…');
@@ -3587,7 +3885,7 @@ mats.forEach(mat => {
         'canvas.getContext("webgl") === null'
       );
     }
-    addLog('✓ WebGL доступен', 'ok');
+    addLog(' WebGL доступен', 'ok');
 
     // ── Step 3: GLTFLoader ──
     addLog('Проверка GLTFLoader…');
@@ -3599,7 +3897,7 @@ mats.forEach(mat => {
         'THREE.GLTFLoader === undefined'
       );
     }
-    addLog('✓ GLTFLoader', 'ok');
+    addLog(' GLTFLoader', 'ok');
 
     // ── Step 4: OrbitControls ──
     addLog('Проверка OrbitControls…');
@@ -3611,14 +3909,14 @@ mats.forEach(mat => {
         'THREE.OrbitControls === undefined'
       );
     }
-    addLog('✓ OrbitControls', 'ok');
+    addLog(' OrbitControls', 'ok');
 
     // ── Step 5: Protocol check ──
     const isFileProto = location.protocol === 'file:';
     if (isFileProto) {
-      addLog('⚠ file:// протокол', 'warn');
+      addLog(' file:// протокол', 'warn');
     } else {
-      addLog('✓ Протокол: ' + location.protocol, 'ok');
+      addLog(' Протокол: ' + location.protocol, 'ok');
     }
 
     const W = mount.clientWidth  || 400;
@@ -3640,7 +3938,7 @@ mats.forEach(mat => {
       perfStateRef.current.dpr = initialQuality.resolutionScale;
       perfStateRef.current.raycastIntervalMs = initialQuality.raycastIntervalMs;
       mount.appendChild(renderer.domElement);
-      addLog('✓ WebGLRenderer создан', 'ok');
+      addLog(' WebGLRenderer создан', 'ok');
     } catch(e) {
       return fail('Ошибка создания WebGLRenderer', String(e), 'Возможно, браузер ограничивает число WebGL-контекстов. Перезагрузите страницу.', String(e));
     }
@@ -3837,6 +4135,12 @@ mats.forEach(mat => {
                 normalizeMeshName(child.name) ||
                 child.name
               );
+              child.userData = {
+                ...(child.userData || {}),
+                hmCat: cat,
+                hmGroup: layer.name,
+                hmOrganId: organId,
+              };
               child.material = Array.isArray(child.material)
                 ? child.material.map(cloneMat)
                 : cloneMat(child.material);
@@ -3889,8 +4193,8 @@ mats.forEach(mat => {
           const { onGroupList: ogl } = propsRef.current;
           if (ogl) ogl(groups);
 
-          addLog(`✓ Слоёв: ${items.length}`, 'ok');
-          addLog(`✓ Мешей: ${meshCount}`, 'ok');
+          addLog(` Слоёв: ${items.length}`, 'ok');
+          addLog(` Мешей: ${meshCount}`, 'ok');
           loadedRef.current = true;
           applyRef.current();
           sceneRef.current.invalidate && sceneRef.current.invalidate();
@@ -4011,7 +4315,7 @@ mats.forEach(mat => {
         for (const h of allHits2) {
           const name = h.object?.name;
           if (!name) continue;
-          const cat = getCat(name);
+          const cat = h.object?.userData?.hmCat || getCat(name);
           const entry = getMeshClinicalEntry(name, cat, od3);
           const hitStatus = entry?._nlpUpgrade || entry?.status || "none";
           if (critOnly && hitStatus !== "sick" && hitStatus !== "warning") continue;
@@ -4186,7 +4490,7 @@ mats.forEach(mat => {
           <div style={{width:"100%",maxWidth:340}}>
             {/* Header */}
             <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
-              <div style={{fontSize:22,flexShrink:0}}>🔴</div>
+              <div style={{fontSize:22,flexShrink:0}}></div>
               <div>
                 <div style={{fontSize:13,color:C.red2,fontWeight:700,lineHeight:1.3}}>{errorInfo.title}</div>
                 <div style={{fontSize:9,color:C.muted,marginTop:2,fontFamily:C.mono}}>3D Model Error</div>
@@ -4697,7 +5001,7 @@ function NLPNotesEditor({ value, onChange, onSave, onCancel, saved, placeholder=
       <NLPInsightBadge results={results} isAnalyzing={isAnalyzing}/>
       <div style={{display:"flex",gap:8,marginTop:8}}>
         {onSave&&<button onClick={onSave} style={{flex:1,padding:"8px 16px",background:saved?"rgba(22,163,74,0.8)":C.blue,color:"#fff",border:"none",borderRadius:9,fontSize:12,fontWeight:700,cursor:"pointer",transition:"background 0.3s"}}>
-          {saved?"✓ Сохранено":"Сохранить и синхронизировать"}
+          {saved?" Сохранено":"Сохранить и синхронизировать"}
         </button>}
         {onCancel&&<button onClick={onCancel} style={{padding:"8px 12px",background:"transparent",border:`1px solid ${C.border2}`,borderRadius:9,fontSize:11,color:C.muted,cursor:"pointer"}}>Отмена</button>}
       </div>
@@ -4721,7 +5025,7 @@ function ScanDescriptionEditor({ oid, pid, existingDesc }) {
   return (
     <div style={{marginTop:8}}>
       <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.7,textTransform:"uppercase",marginBottom:5}}>
-        📝 Описание снимка
+         Описание снимка
         <span style={{marginLeft:6,fontSize:8,color:"rgba(3,194,252,0.5)",fontWeight:400,textTransform:"none"}}>
           — ИИ-анализ подключится автоматически
         </span>
@@ -4740,7 +5044,7 @@ function ScanDescriptionEditor({ oid, pid, existingDesc }) {
       <NLPInsightBadge results={results} isAnalyzing={isAnalyzing}/>
       <button onClick={save} style={{marginTop:6,padding:"5px 14px",background:saved?"rgba(22,163,74,0.7)":C.surf,
         border:`1px solid ${saved?C.green:C.border2}`,borderRadius:7,fontSize:10,color:saved?C.green2:C.blue2,cursor:"pointer",fontWeight:600,transition:"all 0.25s"}}>
-        {saved?"✓ Сохранено":"Сохранить описание"}
+        {saved?" Сохранено":"Сохранить описание"}
       </button>
     </div>
   );
@@ -4778,6 +5082,14 @@ function OrganDetail({ pid, oid, isDoctor }) {
   const statusLabel = {sick:"Патология выявлена",healthy:"Норма",warning:"Требует наблюдения"};
   let labValues = {};
   try { labValues = JSON.parse(data?.lab_values || "{}"); } catch{}
+  const hasScanImages = useMemo(() => {
+    const rows = dbQuery(
+      "SELECT organ_id,study_type,dicom_refs,payload,date_iso,id FROM timeline_items WHERE patient_id=? AND organ_id=? ORDER BY date_iso DESC, id DESC",
+      [pid, oid]
+    );
+    const idx = buildTimelineImageIndexForRows(rows);
+    return hasTimelineImages(idx, oid, data?.study_type || "");
+  }, [pid, oid, data?.study_type, data?.study_date]);
 
   return (
     <div ref={ref} className="fade-in">
@@ -4803,7 +5115,7 @@ function OrganDetail({ pid, oid, isDoctor }) {
 
       {!data ? (
         <div style={{padding:"32px 16px",textAlign:"center",color:C.muted}}>
-          <div style={{fontSize:32,marginBottom:10,opacity:0.18}}>🔬</div>
+          <div style={{fontSize:32,marginBottom:10,opacity:0.18}}></div>
           <div style={{fontSize:13}}>Анализы не загружены</div>
           <div style={{fontSize:11,marginTop:4}}>Исследования появятся после добавления врачом</div>
         </div>
@@ -4821,7 +5133,7 @@ function OrganDetail({ pid, oid, isDoctor }) {
           {/* fracture status for bones */}
           {meta?.g==="bone"&&data.fracture_status&&(
             <div style={{marginBottom:13,padding:"10px 13px",background:`${sc}08`,border:`1px solid ${sc}20`,borderLeft:`3px solid ${sc}`,borderRadius:8,display:"flex",gap:9,alignItems:"center"}}>
-              <span style={{fontSize:18}}>🦴</span>
+              <span style={{fontSize:18}}></span>
               <div>
                 <div style={{fontSize:8,color:C.muted,fontWeight:700,letterSpacing:0.6,textTransform:"uppercase"}}>Статус</div>
                 <div style={{fontSize:13,color:sc,fontWeight:700,marginTop:3}}>{data.fracture_status}</div>
@@ -4829,24 +5141,26 @@ function OrganDetail({ pid, oid, isDoctor }) {
             </div>
           )}
           {/* scans */}
-          <div style={{marginBottom:13}}>
-            <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}>📷 Снимки с разметкой</div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:8}}>
-              <ScanCard status={data.status} label="Срез A"/>
-              <ScanCard status={data.status} label="Срез B"/>
+          {hasScanImages && (
+            <div style={{marginBottom:13}}>
+              <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}> Снимки с разметкой</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:8}}>
+                <ScanCard status={data.status} label="Срез A"/>
+                <ScanCard status={data.status} label="Срез B"/>
+              </div>
+              {/* Scan description with NLP infrastructure */}
+              {isDoctor&&<ScanDescriptionEditor oid={oid} pid={pid} existingDesc={data.findings}/>}
             </div>
-            {/* Scan description with NLP infrastructure */}
-            {isDoctor&&<ScanDescriptionEditor oid={oid} pid={pid} existingDesc={data.findings}/>}
-          </div>
+          )}
           {/* findings */}
           <div style={{marginBottom:13}}>
-            <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}>📋 Заключение</div>
+            <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}> Заключение</div>
             <div style={{background:`${sc}08`,border:`1px solid ${sc}18`,borderLeft:`3px solid ${sc}`,borderRadius:8,padding:"11px 13px",fontSize:12,color:C.text,lineHeight:1.75}}>{data.findings}</div>
           </div>
           {/* lab values */}
           {Object.keys(labValues).length>0&&(
             <div style={{marginBottom:13}}>
-              <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}>🧪 Лабораторные показатели</div>
+              <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}> Лабораторные показатели</div>
               <div style={{background:C.bg3,borderRadius:8,border:`1px solid ${C.border}`,overflow:"hidden"}}>
                 {Object.entries(labValues).map(([k,v],i)=>(
                   <div key={k} style={{display:"flex",justifyContent:"space-between",padding:"7px 12px",background:i%2===0?"transparent":"rgba(255,255,255,0.02)"}}>
@@ -4860,7 +5174,7 @@ function OrganDetail({ pid, oid, isDoctor }) {
           {/* doctor notes */}
           {isDoctor ? (
             <div>
-              <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}>💊 Рекомендации врача</div>
+              <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}> Рекомендации врача</div>
               {editing||!notes ? (
                 <NLPNotesEditor
                   value={notes}
@@ -4872,13 +5186,13 @@ function OrganDetail({ pid, oid, isDoctor }) {
               ) : (
                 <div>
                   <div style={{background:"rgba(34,197,94,0.07)",border:`1px solid rgba(34,197,94,0.18)`,borderLeft:`3px solid ${C.green2}`,borderRadius:8,padding:"11px 13px",fontSize:12,color:C.text,lineHeight:1.7,marginBottom:8}}>{notes}</div>
-                  <button onClick={()=>setEditing(true)} style={{padding:"6px 14px",background:C.surf,border:`1px solid ${C.border2}`,borderRadius:7,fontSize:11,color:C.blue2,cursor:"pointer",fontWeight:600}}>✏️ Редактировать</button>
+                  <button onClick={()=>setEditing(true)} style={{padding:"6px 14px",background:C.surf,border:`1px solid ${C.border2}`,borderRadius:7,fontSize:11,color:C.blue2,cursor:"pointer",fontWeight:600}}> Редактировать</button>
                 </div>
               )}
             </div>
           ) : notes&&(
             <div>
-              <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}>💊 Назначения лечащего врача</div>
+              <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}> Назначения лечащего врача</div>
               <div style={{background:"rgba(34,197,94,0.07)",border:`1px solid rgba(34,197,94,0.18)`,borderLeft:`3px solid ${C.green2}`,borderRadius:8,padding:"11px 13px",fontSize:12,color:C.text,lineHeight:1.7}}>{notes}</div>
             </div>
           )}
@@ -4896,7 +5210,7 @@ function OrgSummary({ pid }) {
   const rows = dbQuery("SELECT * FROM organ_data WHERE patient_id=?", [pid]);
   if (!rows.length) return (
     <div style={{padding:"36px",textAlign:"center",color:C.muted,display:"flex",flexDirection:"column",alignItems:"center",gap:10}}>
-      <div style={{width:52,height:52,borderRadius:16,background:C.surf,border:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,opacity:0.5}}>📊</div>
+      <div style={{width:52,height:52,borderRadius:16,background:C.surf,border:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,opacity:0.5}}></div>
       <div style={{fontSize:13,fontWeight:600,color:C.dim}}>Нет данных исследований</div>
       <div style={{fontSize:11}}>Добавьте результаты анализов</div>
     </div>
@@ -4915,7 +5229,7 @@ function OrgSummary({ pid }) {
       </div>
       {sick.length>0&&(
         <div>
-          <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:5}}>⚠ Выявленные патологии</div>
+          <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:5}}> Выявленные патологии</div>
           {sick.map(r=>(
             <div key={r.organ_id} style={{background:"rgba(239,68,68,0.07)",border:`1px solid rgba(239,68,68,0.17)`,borderLeft:`3px solid ${C.red2}`,borderRadius:8,padding:"9px 13px",fontSize:12,color:C.text,lineHeight:1.65,marginBottom:6}}>
               <span style={{fontWeight:700,color:C.red2}}>{OM[r.organ_id]?.n||r.organ_id}: </span>{r.findings}
@@ -4925,7 +5239,7 @@ function OrgSummary({ pid }) {
       )}
       {warn.length>0&&(
         <div>
-          <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:5}}>🟡 Требует наблюдения</div>
+          <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:5}}> Требует наблюдения</div>
           {warn.map(r=>(
             <div key={r.organ_id} style={{background:"rgba(249,115,22,0.07)",border:`1px solid rgba(249,115,22,0.17)`,borderLeft:`3px solid ${C.orange2}`,borderRadius:8,padding:"9px 13px",fontSize:12,color:C.text,lineHeight:1.65,marginBottom:6}}>
               <span style={{fontWeight:700,color:C.orange2}}>{OM[r.organ_id]?.n||r.organ_id}: </span>{r.findings}
@@ -4943,11 +5257,11 @@ function OrgSummary({ pid }) {
 
 // Layer definitions — compact icon-only toggles
 const LAYERS = [
-  { id:"skeletal",       label:"Скелет",   icon:"🦴", title:"Skeletal system" },
-  { id:"muscular",       label:"Мышцы",    icon:"💪", title:"Muscular system" },
-  { id:"cardiovascular", label:"Сосуды",   icon:"❤️", title:"Cardiovascular system" },
-  { id:"visceral",       label:"Органы",   icon:"🫀", title:"Visceral systems" },
-  { id:"nervous",        label:"Нервная",  icon:"🧠", title:"Nervous system" },
+  { id:"skeletal",       label:"Скелет",   icon:"", title:"Skeletal system" },
+  { id:"muscular",       label:"Мышцы",    icon:"", title:"Muscular system" },
+  { id:"cardiovascular", label:"Сосуды",   icon:"", title:"Cardiovascular system" },
+  { id:"visceral",       label:"Органы",   icon:"", title:"Visceral systems" },
+  { id:"nervous",        label:"Нервная",  icon:"", title:"Nervous system" },
   { id:"skin",           label:"Кожа",     icon:"◻",  title:"Skin" },
 ];
 
@@ -5032,14 +5346,14 @@ function LabsOverlay({ od, gender }) {
 
 /* Layer popup — ordered display names matching user spec */
 const LAYER_POPUP_ITEMS = [
-  { name: "skeletal",       label: "Костная система",                  icon: "🦴" },
-  { name: "joints",         label: "Суставы",                          icon: "🔗" },
-  { name: "visceral",       label: "Органы",                           icon: "🫀" },
-  { name: "cardiovascular", label: "Сердечно-сосудистая система",      icon: "❤️" },
-  { name: "nervous",        label: "Нервная система и органы чувств",  icon: "⚡" },
-  { name: "lymphoid",       label: "Лимфоидная система",               icon: "🫧" },
-  { name: "muscular",       label: "Мышечная система",                 icon: "💪" },
-  { name: "outerlayer",     label: "Наружный слой",                    icon: "🧍" },
+  { name: "skeletal",       label: "Костная система",                  icon: "" },
+  { name: "joints",         label: "Суставы",                          icon: "" },
+  { name: "visceral",       label: "Органы",                           icon: "" },
+  { name: "cardiovascular", label: "Сердечно-сосудистая система",      icon: "" },
+  { name: "nervous",        label: "Нервная система и органы чувств",  icon: "" },
+  { name: "lymphoid",       label: "Лимфоидная система",               icon: "" },
+  { name: "muscular",       label: "Мышечная система",                 icon: "" },
+  { name: "outerlayer",     label: "Наружный слой",                    icon: "" },
 ];
 
 function GroupPanel({ groups, groupVis, onToggle, onClose, excludeRef }) {
@@ -5133,7 +5447,7 @@ function _OLD_GroupPanel({ groups, groupVis, onToggle }) {
 
   const rows = TARGET_GROUPS.map(tg => {
     const loaded = groups.find(g => g.name === tg.name);
-    return { name: tg.name, displayName: tg.ru, icon: tg.icon||"📁", count: loaded ? loaded.meshes.length : null };
+    return { name: tg.name, displayName: tg.ru, icon: tg.icon||"", count: loaded ? loaded.meshes.length : null };
   });
 
   // Only show rows that are either loaded or have defaultOn
@@ -5153,7 +5467,7 @@ function _OLD_GroupPanel({ groups, groupVis, onToggle }) {
   // Simpler: just show all groups that exist in model, plus always show defaultOn groups
   const finalRows = TARGET_GROUPS.map(tg => {
     const loaded = groups.find(g => g.name === tg.name);
-    return { name: tg.name, displayName: tg.ru, icon: tg.icon||"📁", count: loaded ? loaded.meshes.length : null, found: !!loaded };
+    return { name: tg.name, displayName: tg.ru, icon: tg.icon||"", count: loaded ? loaded.meshes.length : null, found: !!loaded };
   });
 
   const foundCount = finalRows.filter(r => r.found).length;
@@ -5289,10 +5603,38 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
   let aiData = {};
   try { aiData = JSON.parse(aiRow?.findings || "{}"); } catch {}
   const aiOrganMap = canonicalizeOrganMap(aiData.organMap || {});
+  const [timelineNowMs, setTimelineNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    let timer = null;
+    const syncNow = () => setTimelineNowMs(Date.now());
+    const scheduleNextDayTick = () => {
+      const now = new Date();
+      const next = new Date(now);
+      next.setHours(24, 0, 2, 0);
+      const waitMs = Math.max(1000, next.getTime() - now.getTime());
+      timer = setTimeout(() => {
+        syncNow();
+        scheduleNextDayTick();
+      }, waitMs);
+    };
+    scheduleNextDayTick();
+    const onFocus = () => syncNow();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") syncNow();
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      if (timer) clearTimeout(timer);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [pid]);
 
   const timelineModel = useMemo(() => {
-    return buildClinicalTimelineModel(timelineSourceRows, Date.now(), TL_DEFAULT_TTL_DAYS);
-  }, [timelineSourceRows.map(r => `${r.organ_id}|${r.status}|${timelineRowDate(r)}|${r.study_type}|${r.findings}|${r.notes}`).join("||")]);
+    return buildClinicalTimelineModel(timelineSourceRows, timelineNowMs, TL_DEFAULT_TTL_DAYS);
+  }, [timelineNowMs, timelineSourceRows.map(r => `${r.organ_id}|${r.status}|${timelineRowDate(r)}|${r.study_type}|${r.findings}|${r.notes}`).join("||")]);
   const timelineEntries = timelineModel.entries || [];
   const timelineTasks = timelineModel.tasks || [];
 
@@ -5320,8 +5662,12 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
 
   const nlpOrganMap = useMemo(()=>{
     // Collect all text: findings + notes from the current source rows
-    const source = (showTimeline && timelineEntries.length)
-      ? (timelineEntries[safeIdx]?.snapshot || timelineEntries[safeIdx]?.organs || odRows)
+    const source = timelineEntries.length
+      ? (
+          showTimeline
+            ? (timelineEntries[safeIdx]?.snapshot || timelineEntries[safeIdx]?.organs || odRows)
+            : (timelineEntries[timelineEntries.length - 1]?.snapshot || timelineEntries[timelineEntries.length - 1]?.organs || odRows)
+        )
       : odRows;
     const allText = (Array.isArray(source)?source:odRows)
       .map(r=>[r.findings||"", r.notes||""].join(" ")).join(" ");
@@ -5333,8 +5679,12 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
 
   // Merge: DB status takes priority; NLP fills gaps or upgrades where DB has "none"
   const od = useMemo(()=>{
-    const source = (showTimeline && timelineEntries.length)
-      ? (timelineEntries[safeIdx]?.snapshot || timelineEntries[safeIdx]?.organs || odRows)
+    const source = timelineEntries.length
+      ? (
+          showTimeline
+            ? (timelineEntries[safeIdx]?.snapshot || timelineEntries[safeIdx]?.organs || odRows)
+            : (timelineEntries[timelineEntries.length - 1]?.snapshot || timelineEntries[timelineEntries.length - 1]?.organs || odRows)
+        )
       : odRows;
     const m = {};
     (Array.isArray(source)?source:odRows).forEach(r=>{ m[r.organ_id]={...r}; });
@@ -5397,7 +5747,7 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
           cursor:"pointer",display:"flex",alignItems:"center",
           transition:"all 0.18s",fontSize:9,fontWeight:600,whiteSpace:"nowrap",
         }}>
-          <span style={{fontSize:12}}>📁</span>
+          <span style={{fontSize:12}}></span>
           <span>Слои</span>
           {groups.length>0&&<span style={{fontSize:8,opacity:0.55,fontFamily:"IBM Plex Mono,monospace"}}>{groups.length}</span>}
         </button>
@@ -5424,7 +5774,7 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
           color:xrayMode?"#03C2FC":C.muted,
           cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",
           transition:"all 0.18s",fontSize:14,
-        }}>🩻</button>
+        }}></button>
         <button onClick={()=>setCriticalOnlyMode(v=>!v)} title={criticalOnlyMode?"Показать все статусы":"Только патология + наблюдение"} style={{
           width:24,height:24,borderRadius:6,flexShrink:0,
           border:`1.5px solid ${criticalOnlyMode?"rgba(249,115,22,0.62)":C.border2}`,
@@ -5570,7 +5920,7 @@ function AddOrganModal({ pid, onClose }) {
           </select>
           <div style={{fontSize:9,color:C.muted,fontWeight:700,letterSpacing:0.7,textTransform:"uppercase",marginBottom:6}}>Статус</div>
           <div style={{display:"flex",gap:7,marginBottom:12}}>
-            {[["healthy","✅ Норма","rgba(20,220,150,0.8)"],["warning","🟡 Наблюдение",C.orange2],["sick","🔴 Патология",C.red2]].map(([s,l,c])=>(
+            {[["healthy"," Норма","rgba(20,220,150,0.8)"],["warning"," Наблюдение",C.orange2],["sick"," Патология",C.red2]].map(([s,l,c])=>(
               <button key={s} onClick={()=>setF({...f,status:s})} style={{flex:1,padding:"7px",border:`2px solid ${f.status===s?c:C.border2}`,borderRadius:8,cursor:"pointer",background:f.status===s?`${c}15`:C.surf,color:f.status===s?c:C.dim,fontWeight:600,fontSize:11,transition:"all 0.15s"}}>{l}</button>
             ))}
           </div>
@@ -5622,7 +5972,7 @@ function AddPatientModal({ doctorId, onClose }) {
         <div style={{padding:"14px 20px"}}>
           <input style={iS} placeholder="ФИО полностью" value={f.name} onChange={e=>setF({...f,name:e.target.value})}/>
           <div style={{display:"flex",gap:7,marginBottom:9}}>
-            {[["male","♂ Мужской"],["female","♀ Женский"]].map(([id,l])=>(
+            {[["male"," Мужской"],["female"," Женский"]].map(([id,l])=>(
               <button key={id} onClick={()=>setF({...f,gender:id})} style={{flex:1,padding:"8px",border:`2px solid ${f.gender===id?C.blue:C.border2}`,borderRadius:8,cursor:"pointer",background:f.gender===id?"rgba(37,99,235,0.12)":C.surf,color:f.gender===id?C.blue2:C.dim,fontWeight:600,fontSize:12}}>{l}</button>
             ))}
           </div>
@@ -5862,6 +6212,7 @@ const TL_BASE_COLORS = {
 const TL_SIGNAL_PRIORITY = { red: 5, orange: 4, yellow: 2, blue: 1, gray: 0 };
 const TL_STATUS_TO_SIGNAL = { sick: "red", warning: "orange", healthy: "gray", none: "gray" };
 const TL_DEFAULT_TTL_DAYS = { red: 180, orange: 90, yellow: 30, blue: 365, gray: 365 };
+const TL_OUTLINE_AFTER_DAYS = 90;
 const TL_ORGAN_TTL_OVERRIDES = {
   heart: { red: 150, orange: 90 },
   lung_left: { red: 180, orange: 90 },
@@ -5880,8 +6231,15 @@ function timelineRowDate(row) {
 function mapTimelineItemToClinicalRow(row) {
   let payload = {};
   try { payload = JSON.parse(row?.payload || "{}"); } catch (_) {}
-  const statusFromPayload = payload?.status || payload?.organ_status || "";
-  const status = statusFromPayload || signalToStatus(row?.color, row?.subtype);
+  const statusCandidate =
+    payload?.organ_status ||
+    payload?.clinical_status ||
+    payload?.status ||
+    row?.organ_status ||
+    row?.clinical_status ||
+    row?.status ||
+    "";
+  const status = normalizeClinicalStatus(statusCandidate, row?.color, row?.subtype);
   return {
     organ_id: canonicalizeOrganId(row?.organ_id || payload?.organ_id || ""),
     status: status || "none",
@@ -5921,6 +6279,14 @@ function timelineShortDate(dateStr) {
   return `${String(d.getUTCDate()).padStart(2, "0")}.${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
+function timelineLocalDateKey(ms = Date.now()) {
+  const d = new Date(ms);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function detectTimelineSubtype(row) {
   const txt = `${row?.findings || ""} ${row?.notes || ""}`.toLowerCase();
   if (/artifact|artefact|артефакт|motion|техническ|низк.*качеств/.test(txt)) return "technical";
@@ -5931,7 +6297,7 @@ function detectTimelineSubtype(row) {
 
 function detectScheduledPending(row) {
   const txt = `${row?.findings || ""} ${row?.notes || ""}`.toLowerCase();
-  return /\bscheduled[_\s-]?pending\b|контроль.*назнач|повторн.*обслед|не явил|не приш[её]л/.test(txt);
+  return /\bscheduled[_\s-]?pending\b|контроль.*назнач|повторн.*обслед|не явил|не приш[её]л|no[-\s]?show|did not attend|missed follow[-\s]?up|missed appointment/.test(txt);
 }
 
 function normalizeAiConfidence(row) {
@@ -5994,32 +6360,56 @@ function buildClinicalTimelineModel(rows, nowMs = Date.now(), ttlConfig = TL_DEF
     const ageDays = Math.max(0, (nowMs - ts) / 86400000);
     const subtype = detectTimelineSubtype(r);
     const scheduledPending = detectScheduledPending(r);
-    const baseSignal = subtype === "technical" ? "blue" : (TL_STATUS_TO_SIGNAL[r.status] || "gray");
+    const normalizedStatus = normalizeClinicalStatus(r?.status, r?.color, r?.subtype);
+    const healed = detectResolvedOutcome(r, normalizedStatus);
+    const baseSignal = subtype === "technical" ? "blue" : (TL_STATUS_TO_SIGNAL[normalizedStatus] || "gray");
     const ttlDays = resolveTtlDays(r, baseSignal, ttlConfig);
-    const phase = scheduledPending ? "overdue" : computeTimelinePhase(ageDays, ttlDays);
-    const visualSignal = phase === "overdue" ? "yellow" : (phase === "stale" ? "gray" : baseSignal);
+    const basePhase = scheduledPending ? "overdue" : computeTimelinePhase(ageDays, ttlDays);
+    const isCriticalSignal = baseSignal === "red" || baseSignal === "orange";
+    const outlineDueToPending = scheduledPending && isCriticalSignal;
+    const outlineDueToAge = ageDays >= TL_OUTLINE_AFTER_DAYS && isCriticalSignal;
+    const outlineOnly = !healed && (outlineDueToPending || outlineDueToAge);
+    const phase = healed ? "resolved" : basePhase;
+    const visualSignal = healed
+      ? "gray"
+      : (outlineOnly ? baseSignal : (basePhase === "overdue" ? "yellow" : (basePhase === "stale" ? "gray" : baseSignal)));
     const aiConfidence = normalizeAiConfidence(r);
-    const clinicalSeverity = r.status === "sick" ? 1 : r.status === "warning" ? 0.7 : 0.2;
-    const priorityScore = computeTimelinePriority({ signal: baseSignal, aiConfidence, clinicalSeverity, ageDays, phase });
+    const displayStatus = healed ? "none" : normalizedStatus;
+    const clinicalSeverity = displayStatus === "sick" ? 1 : displayStatus === "warning" ? 0.7 : 0.2;
+    const priorityScore = healed ? 0 : computeTimelinePriority({
+      signal: baseSignal,
+      aiConfidence,
+      clinicalSeverity,
+      ageDays,
+      phase: basePhase,
+    });
     const timelineMeta = {
       timestamp: ts,
       ageDays,
       ttlDays,
       phase,
+      basePhase,
       subtype,
       signal: baseSignal,
       visualSignal,
+      displayStatus,
       aiConfidence,
       priorityScore,
-      scheduledPending,
-      isOverdue: phase === "overdue",
-      isCritical: baseSignal === "red" || baseSignal === "orange",
-      hex: timelineHexBySignalPhase(visualSignal, phase),
+      healed,
+      scheduledPending: healed ? false : scheduledPending,
+      isOverdue: !healed && basePhase === "overdue",
+      isCritical: !healed && isCriticalSignal,
+      outlineOnly,
+      outlineSignal: outlineOnly ? baseSignal : "",
+      outlineReason: outlineDueToPending ? "scheduled_pending" : (outlineDueToAge ? "ttl_90d" : ""),
+      hex: healed
+        ? TL_BASE_COLORS.gray
+        : (outlineOnly ? timelineHexBySignalPhase(baseSignal, "bright") : timelineHexBySignalPhase(visualSignal, basePhase)),
     };
     const dateKey = rowDate || "Неизвестно";
     if (!byDate[dateKey]) byDate[dateKey] = { date: dateKey, timestamp: ts, organs: [] };
     byDate[dateKey].timestamp = Math.max(byDate[dateKey].timestamp, ts);
-    byDate[dateKey].organs.push({ ...r, _timeline: timelineMeta });
+    byDate[dateKey].organs.push({ ...r, status: normalizedStatus, _timeline: timelineMeta });
   });
 
   const sortedEntries = Object.values(byDate).sort((a, b) => a.timestamp - b.timestamp);
@@ -6037,12 +6427,13 @@ function buildClinicalTimelineModel(rows, nowMs = Date.now(), ttlConfig = TL_DEF
       const hasCritical = organs.some(o => o._timeline?.isCritical);
       const hasOverdue = organs.some(o => o._timeline?.isOverdue);
       const scheduledPendingCount = organs.filter(o => o._timeline?.scheduledPending).length;
+      const displayStatuses = organs.map(o => o._timeline?.displayStatus || o.status || "none");
       return {
         ...entry,
         shortDate: timelineShortDate(entry.date),
         snapshot: Array.from(rollingOrganState.values()).map(v => ({ ...v })),
-        worstStatus: hasCritical ? (organs.some(o => o.status === "sick") ? "sick" : "warning")
-          : (organs.some(o => o.status === "healthy") ? "healthy" : "none"),
+        worstStatus: hasCritical ? (displayStatuses.some(s => s === "sick") ? "sick" : "warning")
+          : (displayStatuses.some(s => s === "healthy") ? "healthy" : "none"),
         worstSignal: top.visualSignal || "gray",
         worstHex: top.hex || TL_BASE_COLORS.gray,
         priorityScore: top.priorityScore || 0,
@@ -6051,6 +6442,39 @@ function buildClinicalTimelineModel(rows, nowMs = Date.now(), ttlConfig = TL_DEF
         scheduledPendingCount,
       };
     });
+
+  const todayKey = timelineLocalDateKey(nowMs);
+  let todayIdx = -1;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entryDayKey = timelineLocalDateKey(entries[i]?.timestamp || 0);
+    if (entryDayKey === todayKey) {
+      todayIdx = i;
+      break;
+    }
+  }
+
+  if (todayIdx >= 0) {
+    entries[todayIdx] = { ...entries[todayIdx], isTodayMarker: true };
+  } else {
+    const latest = entries.length ? entries[entries.length - 1] : null;
+    const baseTodayTs = parseTimelineDate(todayKey) ?? nowMs;
+    const markerTs = Math.max(baseTodayTs, Number(latest?.timestamp || 0) + 1, nowMs);
+    entries.push({
+      date: todayKey,
+      shortDate: timelineShortDate(todayKey),
+      timestamp: markerTs,
+      organs: [],
+      snapshot: Array.isArray(latest?.snapshot) ? latest.snapshot.map(v => ({ ...v })) : [],
+      worstStatus: latest?.worstStatus || "none",
+      worstSignal: latest?.worstSignal || "gray",
+      worstHex: latest?.worstHex || TL_BASE_COLORS.gray,
+      priorityScore: latest?.priorityScore || 0,
+      hasCritical: !!latest?.hasCritical,
+      hasOverdue: !!latest?.hasOverdue,
+      scheduledPendingCount: Number(latest?.scheduledPendingCount || 0),
+      isTodayMarker: true,
+    });
+  }
 
   const tasks = [];
   entries.forEach(entry => {
@@ -6122,8 +6546,8 @@ function VerticalTimelineBar({ entries, currentIdx, onTimeChange, tasks = [], co
 
   const indexed = useMemo(() => (entries || []).map((e, idx) => ({ ...e, _idx: idx })), [entries]);
   const filtered = useMemo(() => {
-    if (mode === "critical") return indexed.filter(e => e.hasCritical);
-    if (mode === "overdue") return indexed.filter(e => e.hasOverdue || e.scheduledPendingCount > 0);
+    if (mode === "critical") return indexed.filter(e => e.isTodayMarker || e.hasCritical);
+    if (mode === "overdue") return indexed.filter(e => e.isTodayMarker || e.hasOverdue || e.scheduledPendingCount > 0);
     return indexed;
   }, [indexed, mode]);
 
@@ -6274,7 +6698,7 @@ function VerticalTimelineBar({ entries, currentIdx, onTimeChange, tasks = [], co
                 boxShadow: active ? `0 0 8px ${c}` : "none",
                 position:"relative",
               }}>
-                {pending && <span style={{position:"absolute",right:-7,top:-8,fontSize:8,lineHeight:1}}>🕒</span>}
+                {pending && <span style={{position:"absolute",right:-7,top:-8,fontSize:8,lineHeight:1}}></span>}
               </div>
             </div>
           );
@@ -6379,7 +6803,7 @@ function FloatingModelWindow({ patient, onClose, onAddStudy, onOrganSelect, selO
         <div style={{flex:1,minWidth:0}}>
           <div style={{fontSize:11,fontWeight:700,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{patient.name}</div>
           <div style={{fontSize:9,color:"rgba(3,194,252,0.7)",display:"flex",gap:5}}>
-            <span>{patient.gender==="female"?"♀ Жен.":"♂ Муж."}</span>
+            <span>{patient.gender==="female"?" Жен.":" Муж."}</span>
             {patient.dob&&<span style={{fontFamily:C.mono}}>{patient.dob}</span>}
           </div>
         </div>
@@ -6423,6 +6847,7 @@ function OrganCard({ r, radNotes, saveRadNote, aiState = "idle" }) {
   const sc2 = {sick:C.red2,warning:C.orange2,healthy:C.green2}[r.status]||"rgba(3,194,252,0.5)";
   let lv = {}; try { lv = JSON.parse(r.lab_values||"{}"); } catch{}
   const stLabel = {sick:"Патология",warning:"Наблюдение",healthy:"Норма"}[r.status]||"Нет данных";
+  const hasScanImages = !!r?._hasImages;
   const aiLabel = aiState==="analyzing" ? "Gemini анализирует…" : aiState==="synced" ? "Gemini синхронизирован" : aiState==="error" ? "Gemini недоступен" : "Gemini: ожидание";
   const aiColor = aiState==="analyzing" ? C.blue2 : aiState==="synced" ? C.green2 : aiState==="error" ? C.red2 : C.muted;
 
@@ -6432,7 +6857,7 @@ function OrganCard({ r, radNotes, saveRadNote, aiState = "idle" }) {
       <div onClick={()=>setExpanded(e=>!e)} style={{padding:"8px 12px",display:"flex",alignItems:"center",gap:8,cursor:"pointer",transition:"background 0.15s"}}
         onMouseEnter={e=>e.currentTarget.style.background="rgba(148,180,220,0.06)"}
         onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-        <span style={{fontSize:15,flexShrink:0}}>{OM[r.organ_id]?.e||"🔬"}</span>
+        <span style={{fontSize:15,flexShrink:0}}>{OM[r.organ_id]?.e||""}</span>
         <span style={{fontSize:12,fontWeight:700,color:C.text,flex:1}}>{OM[r.organ_id]?.n||r.organ_id}</span>
         <span style={{fontSize:10,padding:"1px 7px",borderRadius:8,background:`${sc2}14`,color:sc2,fontWeight:700,flexShrink:0}}>{stLabel}</span>
         {r.study_date&&<span style={{fontSize:10,color:C.muted,fontFamily:C.mono,flexShrink:0}}>{r.study_date}</span>}
@@ -6441,10 +6866,12 @@ function OrganCard({ r, radNotes, saveRadNote, aiState = "idle" }) {
       {expanded&&(
         <div style={{padding:"10px 12px",borderTop:`1px solid ${C.border}`,animation:"fadeUp 0.16s ease both"}}>
           {r.study_type&&<div style={{fontSize:9,color:"rgba(3,194,252,0.6)",fontWeight:700,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:8}}>{r.study_type}</div>}
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
-            <ScanCard status={r.status} label="Срез A"/>
-            <ScanCard status={r.status} label="Срез B"/>
-          </div>
+          {hasScanImages && (
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+              <ScanCard status={r.status} label="Срез A"/>
+              <ScanCard status={r.status} label="Срез B"/>
+            </div>
+          )}
           {Object.keys(lv).length>0&&(
             <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
               {Object.entries(lv).map(([k,v])=>(
@@ -6473,6 +6900,180 @@ function OrganCard({ r, radNotes, saveRadNote, aiState = "idle" }) {
   );
 }
 
+function EMRExplorerOverview({ rows, aiState = "idle", radNotes, saveRadNote, fields, setFields }) {
+  const [selectedEntryId, setSelectedEntryId] = useState(null);
+
+  const aiLabel = aiState==="analyzing" ? "Gemini анализирует…" : aiState==="synced" ? "Gemini синхронизирован" : aiState==="error" ? "Gemini недоступен" : "Gemini: ожидание";
+  const aiColor = aiState==="analyzing" ? C.blue2 : aiState==="synced" ? C.green2 : aiState==="error" ? C.red2 : C.muted;
+
+  const docEntries = useMemo(() => ([
+    { id: "doc:symptoms", label: "Заметки и симптомы", field: "symptoms" },
+    { id: "doc:treatment", label: "Лечение и назначения", field: "treatment" },
+  ]), []);
+
+  const dateTs = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return 0;
+    if (/^\d{2}\.\d{2}\.\d{4}$/.test(raw)) {
+      const [dd, mm, yyyy] = raw.split(".").map(Number);
+      return new Date(yyyy, mm - 1, dd).getTime();
+    }
+    const ts = Date.parse(raw);
+    return Number.isFinite(ts) ? ts : 0;
+  };
+
+  const rowsSignature = (rows || [])
+    .map(r => `${r.organ_id}|${r.study_type || ""}|${r.study_date || ""}|${r.status || ""}|${r.findings || ""}`)
+    .join("||");
+
+  const normalizedRows = useMemo(() => {
+    return (rows || [])
+      .map((r, idx) => ({
+        ...r,
+        _rowId: `${r.organ_id || "org"}::${r.study_type || "type"}::${r.study_date || "date"}::${idx}`,
+        _ts: dateTs(r.study_date),
+      }))
+      .sort((a, b) => (b._ts || 0) - (a._ts || 0));
+  }, [rowsSignature]);
+
+  const filteredRows = normalizedRows;
+
+  useEffect(() => {
+    const isDoc = String(selectedEntryId || "").startsWith("doc:");
+    if (isDoc) return;
+    if (!filteredRows.length) {
+      setSelectedEntryId("doc:symptoms");
+      return;
+    }
+    if (!selectedEntryId || !filteredRows.some(r => r._rowId === selectedEntryId)) {
+      setSelectedEntryId(filteredRows[0]._rowId);
+    }
+  }, [filteredRows, selectedEntryId]);
+
+  const selectedRow = filteredRows.find(r => r._rowId === selectedEntryId) || null;
+  const selectedDoc = docEntries.find(d => d.id === selectedEntryId) || null;
+  const selectedNoteKey = selectedRow ? `${selectedRow.study_type || ""}_${selectedRow.organ_id || ""}` : "";
+  const selectedConclusion = selectedRow ? (radNotes?.[selectedNoteKey] ?? (selectedRow.findings || "")) : "";
+  const selectedStudyName = selectedRow?.study_type || "Исследование";
+  const selectedOrganName = selectedRow ? (OM[selectedRow.organ_id]?.n || selectedRow.organ_id) : "";
+  const selectedModality = /mri|mr|мрт/i.test(selectedStudyName) ? "МРТ" : /ct|кт/i.test(selectedStudyName) ? "КТ" : "Снимок";
+
+  const fileBtnStyle = (active) => ({
+    width:"100%",
+    display:"grid",
+    gridTemplateColumns:"20px minmax(0,1fr) auto",
+    alignItems:"center",
+    gap:8,
+    marginBottom:2,
+    border:"none",
+    borderRadius:7,
+    padding:"7px 8px",
+    textAlign:"left",
+    cursor:"pointer",
+    background:active ? "rgba(255,255,255,0.16)" : "transparent",
+    color:active ? C.text : C.dim,
+    fontSize:11,
+    fontWeight:active ? 700 : 500,
+  });
+
+  const fileIcon = (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M4 2.5h5l3 3V13a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1Z" stroke="currentColor" strokeWidth="1.3"/>
+      <path d="M9 2.5V5.5h3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  );
+
+  return (
+    <div style={{marginBottom:16,background:C.bg3,border:`1px solid ${C.border}`,borderRadius:10,overflow:"hidden"}}>
+      <div style={{padding:"9px 10px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}>
+        <div style={{fontSize:10,fontWeight:700,color:C.dim,letterSpacing:"0.05em",textTransform:"uppercase"}}>Файлы пациента</div>
+        <div style={{fontSize:9,color:aiColor,fontWeight:700,letterSpacing:"0.03em"}}>{aiLabel}</div>
+      </div>
+
+      <div style={{padding:"8px 8px 12px"}}>
+        <div style={{padding:"0 2px 5px",fontSize:9,color:C.muted,fontWeight:700,letterSpacing:"0.05em",textTransform:"uppercase"}}>Анализы</div>
+        <div style={{maxHeight:230,overflowY:"auto",paddingRight:2}}>
+          {!filteredRows.length ? (
+            <div style={{padding:"7px 8px 10px",fontSize:11,color:C.muted}}>Анализы не найдены</div>
+          ) : filteredRows.map(r => {
+            const active = selectedEntryId === r._rowId;
+            const organName = OM[r.organ_id]?.n || r.organ_id;
+            return (
+              <button key={r._rowId} onClick={() => setSelectedEntryId(r._rowId)} style={fileBtnStyle(active)}>
+                <span style={{display:"flex",alignItems:"center",justifyContent:"center",color:active ? C.blue2 : C.muted}}>{fileIcon}</span>
+                <span style={{minWidth:0}}>
+                  <span style={{display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.study_type || "Исследование"} · {organName}</span>
+                  <span style={{display:"block",fontSize:9,color:C.muted,marginTop:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                    {r.study_date || "Дата не указана"}
+                  </span>
+                </span>
+                <span style={{fontSize:10,color:C.muted,fontFamily:C.mono}}>scan</span>
+              </button>
+            );
+          })}
+        </div>
+
+        <div style={{height:1,background:C.border,margin:"10px 4px 8px"}}/>
+        <div style={{padding:"0 2px 5px",fontSize:9,color:C.muted,fontWeight:700,letterSpacing:"0.05em",textTransform:"uppercase"}}>Документы пациента</div>
+        <div>
+          {docEntries.map(doc => {
+            const active = selectedEntryId === doc.id;
+            return (
+              <button key={doc.id} onClick={() => setSelectedEntryId(doc.id)} style={fileBtnStyle(active)}>
+                <span style={{display:"flex",alignItems:"center",justifyContent:"center",color:active ? C.blue2 : C.muted}}>{fileIcon}</span>
+                <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{doc.label}</span>
+                <span style={{fontSize:10,color:C.muted,fontFamily:C.mono}}>txt</span>
+              </button>
+            );
+          })}
+        </div>
+
+        <div style={{height:1,background:C.border,margin:"10px 4px 8px"}}/>
+        {selectedDoc && (
+          <div style={{padding:"2px 4px 2px"}}>
+            <div style={{fontSize:10,color:C.muted,marginBottom:8}}>
+              Пациент / документы / <span style={{color:C.text,fontWeight:700}}>{selectedDoc.label}</span>
+            </div>
+            <textarea
+              rows={selectedDoc.field === "symptoms" ? 5 : 6}
+              placeholder={selectedDoc.field === "symptoms" ? "Жалобы, симптомы пациента..." : "Схема лечения, препараты, дозировки, процедуры..."}
+              value={fields?.[selectedDoc.field] || ""}
+              onChange={e=>setFields(f=>({ ...f, [selectedDoc.field]: e.target.value }))}
+              style={{width:"100%",padding:"10px 12px",background:"rgba(148,180,220,0.04)",border:`1.5px solid ${C.border}`,borderRadius:9,fontSize:11,outline:"none",color:C.text,fontFamily:"inherit",lineHeight:1.65,resize:"vertical",boxSizing:"border-box",transition:"border-color 0.2s"}}
+              onFocus={e=>e.target.style.borderColor="rgba(59,130,246,0.45)"}
+              onBlur={e=>e.target.style.borderColor=C.border}
+            />
+          </div>
+        )}
+
+        {selectedRow && (
+          <div style={{padding:"2px 4px 2px"}}>
+            <div style={{fontSize:10,color:C.muted,marginBottom:8}}>
+              Пациент / анализы / {selectedStudyName} / <span style={{color:C.text,fontWeight:700}}>{selectedOrganName}</span>
+            </div>
+            {!!selectedRow._hasImages && (
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+                <ScanCard status={selectedRow.status} label={`${selectedModality} A`}/>
+                <ScanCard status={selectedRow.status} label={`${selectedModality} B`}/>
+              </div>
+            )}
+            <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:5}}>Заключение</div>
+            <textarea
+              rows={3}
+              placeholder={`Заключение по ${selectedOrganName}...`}
+              value={selectedConclusion}
+              onChange={e => saveRadNote(selectedNoteKey, e.target.value)}
+              style={{width:"100%",padding:"9px 12px",background:"rgba(148,180,220,0.04)",border:`1.5px solid ${C.border}`,borderRadius:9,fontSize:11,outline:"none",color:C.text,fontFamily:"inherit",lineHeight:1.65,resize:"vertical",boxSizing:"border-box",transition:"border-color 0.2s"}}
+              onFocus={e=>e.target.style.borderColor="rgba(59,130,246,0.4)"}
+              onBlur={e=>e.target.style.borderColor=C.border}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ═══════════════════════════════════════════════
    PATIENT OVERVIEW PANEL
    Studies sorted alpha + symptoms/treatment
@@ -6488,7 +7089,6 @@ function PatientRecord({
   onToggleIsolateLayer,
 }) {
   useDB();
-  const [saved, setSaved] = useState(false);
   const [aiLiveState, setAiLiveState] = useState("idle");
 
   // Editable record fields
@@ -6529,6 +7129,16 @@ function PatientRecord({
 
   // All organ studies sorted alphabetically by study_type
   const organRows = dbQuery("SELECT * FROM organ_data WHERE patient_id=? AND organ_id NOT IN ('__record__','__ai__')", [patient.id]);
+  const timelineRowsForImages = dbQuery(
+    "SELECT organ_id,study_type,dicom_refs,payload,date_iso,id FROM timeline_items WHERE patient_id=? ORDER BY date_iso DESC, id DESC",
+    [patient.id]
+  );
+  const timelineRowsForImagesSig = timelineRowsForImages
+    .map(r => `${r.id || ""}|${r.organ_id || ""}|${r.study_type || ""}|${r.date_iso || ""}|${r.dicom_refs || ""}|${r.payload || ""}`)
+    .join("||");
+  const timelineImageIndex = useMemo(() => {
+    return buildTimelineImageIndexForRows(timelineRowsForImages);
+  }, [timelineRowsForImagesSig]);
   const aiOverlayRow = dbGetOne("SELECT * FROM organ_data WHERE patient_id=? AND organ_id='__ai__'", [patient.id]);
   let aiOverlayData = {};
   try { aiOverlayData = JSON.parse(aiOverlayRow?.findings || "{}"); } catch {}
@@ -6539,13 +7149,11 @@ function PatientRecord({
     const a = String(aiOverlayMap?.[organId] || "");
     return (STATUS_PRIORITY[a] ?? 0) > (STATUS_PRIORITY[b] ?? 0) ? a : b;
   };
-  const grouped = {};
-  organRows.forEach(r => {
-    const key = r.study_type || "Без типа";
-    if (!grouped[key]) grouped[key] = [];
-    grouped[key].push(r);
-  });
-  const sortedGroups = Object.keys(grouped).sort((a,b)=>a.localeCompare(b, 'ru'));
+  const resolvedOrganRows = organRows.map(r => ({
+    ...r,
+    status: resolveDisplayStatus(r.status, r.organ_id),
+    _hasImages: hasTimelineImages(timelineImageIndex, r.organ_id, r.study_type),
+  }));
 
   const saveRadNote = (scanKey, val) => {
     const updated = { ...radNotes, [scanKey]: val };
@@ -6557,8 +7165,6 @@ function PatientRecord({
     const t = setTimeout(() => {
       persistRecordSnapshot(fields, radNotes);
       pub('organ_updated', { pid: patient.id, source: 'record_autosave' });
-      setSaved(true);
-      setTimeout(()=>setSaved(false), 1000);
     }, 320);
     return () => clearTimeout(t);
   }, [patient.id, fields.symptoms, fields.treatment, JSON.stringify(radNotes)]);
@@ -6640,17 +7246,10 @@ function PatientRecord({
     return () => { cancelled = true; clearTimeout(t); };
   }, [patient.id, fields.symptoms, fields.treatment, JSON.stringify(radNotes), organFindingsSignature]);
 
-  const fieldStyle = {
-    width:"100%", padding:"10px 13px",
-    background:"rgba(148,180,220,0.05)", border:`1.5px solid ${C.border2}`,
-    borderRadius:10, fontSize:12, outline:"none", color:C.text,
-    fontFamily:"inherit", lineHeight:1.65, resize:"vertical",
-    boxSizing:"border-box", transition:"border-color 0.2s",
-  };
-
   // Current organ tab data
   const activeOrganData = activeOrganTab ? dbGetOne("SELECT * FROM organ_data WHERE patient_id=? AND organ_id=?", [patient.id, activeOrganTab]) : null;
   const activeOrganStatus = resolveDisplayStatus(activeOrganData?.status, activeOrganData?.organ_id);
+  const activeHasImages = !!(activeOrganData && hasTimelineImages(timelineImageIndex, activeOrganData.organ_id, activeOrganData.study_type));
   const activeMeta = activeOrganTab ? OM[activeOrganTab] : null;
   const sc = activeOrganData ? ({sick:C.red2,warning:C.orange2,healthy:C.green2}[activeOrganStatus]||C.muted) : C.muted;
 
@@ -6671,7 +7270,7 @@ function PatientRecord({
           <div style={{fontSize:14,fontWeight:700,color:C.text,letterSpacing:"-0.4px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{patient.name}</div>
           <div style={{display:"flex",gap:7,marginTop:2}}>
             <span style={{fontSize:9,color:C.muted,fontFamily:C.mono}}>{patient.dob||"—"}</span>
-            <span style={{fontSize:9,padding:"1px 6px",borderRadius:4,background:patient.gender==="female"?"rgba(124,58,237,0.15)":"rgba(29,78,216,0.15)",color:patient.gender==="female"?"#c084fc":C.blue2,fontWeight:700}}>{patient.gender==="female"?"♀ Жен.":"♂ Муж."}</span>
+            <span style={{fontSize:9,padding:"1px 6px",borderRadius:4,background:patient.gender==="female"?"rgba(124,58,237,0.15)":"rgba(29,78,216,0.15)",color:patient.gender==="female"?"#c084fc":C.blue2,fontWeight:700}}>{patient.gender==="female"?" Жен.":" Муж."}</span>
           </div>
         </div>
       </div>
@@ -6680,7 +7279,7 @@ function PatientRecord({
       <div style={{display:"flex",background:C.bg4,borderBottom:`1px solid ${C.border}`,flexShrink:0,padding:"0 20px",gap:0,overflowX:"auto"}}>
         <button onClick={()=>onCloseOrganTab&&onCloseOrganTab()}
           style={{padding:"9px 14px",border:"none",cursor:"pointer",fontSize:11,fontWeight:!activeOrganTab?700:500,color:!activeOrganTab?C.blue2:C.muted,background:"transparent",borderBottom:`2px solid ${!activeOrganTab?C.blue:"transparent"}`,transition:"all 0.2s",whiteSpace:"nowrap",flexShrink:0}}>
-          📋 Обзор
+           Обзор
         </button>
         {activeOrganTab&&activeMeta&&(
           <div style={{display:"flex",alignItems:"center",borderBottom:`2px solid ${sc}`,padding:"0 4px"}}>
@@ -6723,57 +7322,14 @@ function PatientRecord({
           <div className="fade-in">
 
             {/* ─ Studies sorted alphabetically ─ */}
-            {sortedGroups.length===0 ? (
-              <div style={{textAlign:"center",padding:"48px 20px",background:C.bg3,borderRadius:14,border:`1px dashed ${C.border2}`,marginBottom:20}}>
-                <div style={{fontSize:36,opacity:0.12,marginBottom:10}}>🔬</div>
-                <div style={{fontSize:13,fontWeight:600,color:C.dim}}>Исследований нет</div>
-                <div style={{fontSize:11,color:C.muted,marginTop:4}}>Нажмите «+ Исследование» для добавления</div>
-              </div>
-            ) : organRows.map(r => (
-              <OrganCard
-                key={r.organ_id}
-                r={{ ...r, status: resolveDisplayStatus(r.status, r.organ_id) }}
-                radNotes={radNotes}
-                saveRadNote={saveRadNote}
-                aiState={aiLiveState}
-              />
-            ))}
-
-            {/* ─ Symptoms ─ */}
-            <div style={{marginBottom:16}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:7}}>
-                <div style={{fontSize:9,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase"}}>Симптомы</div>
-                <div style={{
-                  fontSize:9,fontWeight:700,padding:"4px 8px",borderRadius:999,
-                  background: aiLiveState==="analyzing" ? "rgba(59,130,246,0.12)" : aiLiveState==="synced" ? "rgba(16,185,129,0.12)" : aiLiveState==="error" ? "rgba(239,68,68,0.12)" : "rgba(148,180,220,0.06)",
-                  color: aiLiveState==="analyzing" ? C.blue2 : aiLiveState==="synced" ? C.green2 : aiLiveState==="error" ? C.red2 : C.muted,
-                  border:`1px solid ${aiLiveState==="analyzing" ? "rgba(59,130,246,0.25)" : aiLiveState==="synced" ? "rgba(16,185,129,0.25)" : aiLiveState==="error" ? "rgba(239,68,68,0.25)" : C.border}`
-                }}>
-                  {aiLiveState==="analyzing" ? "Gemini анализирует…" : aiLiveState==="synced" ? "Модель обновлена" : aiLiveState==="error" ? "Gemini недоступен" : "Ожидание ввода"}
-                </div>
-              </div>
-              <textarea rows={3} placeholder="Жалобы, симптомы пациента..." value={fields.symptoms}
-                onChange={e=>setFields(f=>({...f,symptoms:e.target.value}))} style={fieldStyle}
-                onFocus={e=>e.target.style.borderColor="rgba(59,130,246,0.5)"} onBlur={e=>e.target.style.borderColor=C.border2}/>
-            </div>
-
-            {/* ─ Treatment ─ */}
-            <div style={{marginBottom:24}}>
-              <div style={{fontSize:9,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:7}}>Лечение и назначения</div>
-              <textarea rows={4} placeholder="Схема лечения, препараты, дозировки, процедуры..." value={fields.treatment}
-                onChange={e=>setFields(f=>({...f,treatment:e.target.value}))} style={fieldStyle}
-                onFocus={e=>e.target.style.borderColor="rgba(16,185,129,0.5)"} onBlur={e=>e.target.style.borderColor=C.border2}/>
-            </div>
-
-            <div style={{
-              display:"inline-flex",alignItems:"center",gap:8,padding:"9px 12px",
-              background:saved?"rgba(16,185,129,0.10)":"rgba(148,180,220,0.05)",
-              color:saved?C.green2:C.muted,border:`1px solid ${saved?"rgba(16,185,129,0.22)":C.border}`,
-              borderRadius:10,fontSize:11,fontWeight:700
-            }}>
-              <span>{saved ? "✓" : "⟳"}</span>
-              <span>{saved ? "Сохранено автоматически" : "Автосохранение включено"}</span>
-            </div>
+            <EMRExplorerOverview
+              rows={resolvedOrganRows}
+              radNotes={radNotes}
+              saveRadNote={saveRadNote}
+              aiState={aiLiveState}
+              fields={fields}
+              setFields={setFields}
+            />
           </div>
         )}
 
@@ -6801,7 +7357,7 @@ function PatientRecord({
 
             {!activeOrganData ? (
               <div style={{textAlign:"center",padding:"40px 20px",background:C.bg3,borderRadius:12,border:`1px dashed ${C.border2}`}}>
-                <div style={{fontSize:32,opacity:0.12,marginBottom:8}}>🔬</div>
+                <div style={{fontSize:32,opacity:0.12,marginBottom:8}}></div>
                 <div style={{fontSize:12,color:C.muted}}>Данных по этому органу нет</div>
                 <button onClick={onAddStudy} style={{marginTop:12,padding:"7px 18px",background:C.accent,border:`1px solid rgba(59,130,246,0.3)`,borderRadius:8,fontSize:11,color:C.blue2,cursor:"pointer",fontWeight:700}}>
                   Добавить исследование
@@ -6810,13 +7366,15 @@ function PatientRecord({
             ) : (
               <div>
                 {/* Scans */}
-                <div style={{marginBottom:16}}>
+                {activeHasImages && (
+                  <div style={{marginBottom:16}}>
                     <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:8}}>Снимки</div>
                     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-                    <ScanCard status={activeOrganStatus} label="Срез A"/>
-                    <ScanCard status={activeOrganStatus} label="Срез B"/>
+                      <ScanCard status={activeOrganStatus} label="Срез A"/>
+                      <ScanCard status={activeOrganStatus} label="Срез B"/>
                     </div>
                   </div>
+                )}
                 {/* Lab values */}
                 {(()=>{let lv={};try{lv=JSON.parse(activeOrganData.lab_values||"{}");}catch{}return Object.keys(lv).length>0&&(
                   <div style={{marginBottom:16}}>
@@ -6841,7 +7399,7 @@ function PatientRecord({
                 {/* Bone fracture */}
                 {activeMeta.g==="bone"&&activeOrganData.fracture_status&&(
                   <div style={{marginBottom:16,padding:"10px 13px",background:`${sc}08`,border:`1px solid ${sc}20`,borderLeft:`3px solid ${sc}`,borderRadius:9,display:"flex",gap:9,alignItems:"center"}}>
-                    <span style={{fontSize:18}}>🦴</span>
+                    <span style={{fontSize:18}}></span>
                     <div>
                       <div style={{fontSize:8,color:C.muted,fontWeight:700,letterSpacing:0.6,textTransform:"uppercase"}}>Статус перелома</div>
                       <div style={{fontSize:13,color:sc,fontWeight:700,marginTop:3}}>{activeOrganData.fracture_status}</div>
@@ -6901,6 +7459,60 @@ function TBtn({ icon, label, active, onClick, accentColor="rgba(3,194,252,0.55)"
     </div>
   );
 }
+
+const NAV_ICONS = {
+  layers: (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M8 2L14 5.5L8 9L2 5.5L8 2Z" stroke="currentColor" strokeWidth="1.35" strokeLinejoin="round"/>
+      <path d="M2 8.6L8 12L14 8.6" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  ),
+  xray: (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="3" y="3" width="10" height="10" rx="2" stroke="currentColor" strokeWidth="1.35"/>
+      <path d="M5.1 10.9L10.9 5.1" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round"/>
+      <path d="M8 4.6V6.3M8 9.7V11.4M4.6 8H6.3M9.7 8H11.4" stroke="currentColor" strokeWidth="1.15" strokeLinecap="round"/>
+    </svg>
+  ),
+  timeline: (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M4 3.2V12.8" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round"/>
+      <circle cx="4" cy="5" r="1.2" fill="currentColor"/>
+      <circle cx="4" cy="8" r="1.2" fill="currentColor"/>
+      <circle cx="4" cy="11" r="1.2" fill="currentColor"/>
+      <path d="M7 5H12M7 8H11M7 11H13" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round"/>
+    </svg>
+  ),
+  critical: (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M8 2.7L13 11.9C13.2 12.3 12.9 12.8 12.4 12.8H3.6C3.1 12.8 2.8 12.3 3 11.9L8 2.7Z" stroke="currentColor" strokeWidth="1.35" strokeLinejoin="round"/>
+      <path d="M8 6.2V9.3" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round"/>
+      <circle cx="8" cy="11.1" r="0.8" fill="currentColor"/>
+    </svg>
+  ),
+  legend: (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="3.5" cy="4" r="1.2" fill="currentColor"/>
+      <circle cx="3.5" cy="8" r="1.2" fill="currentColor"/>
+      <circle cx="3.5" cy="12" r="1.2" fill="currentColor"/>
+      <path d="M6.2 4H13M6.2 8H13M6.2 12H13" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round"/>
+    </svg>
+  ),
+  quality: (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M3 4.5H13M3 8H13M3 11.5H13" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round"/>
+      <circle cx="6" cy="4.5" r="1.4" fill={C.bg4} stroke="currentColor" strokeWidth="1.2"/>
+      <circle cx="10" cy="8" r="1.4" fill={C.bg4} stroke="currentColor" strokeWidth="1.2"/>
+      <circle cx="8" cy="11.5" r="1.4" fill={C.bg4} stroke="currentColor" strokeWidth="1.2"/>
+    </svg>
+  ),
+  patients: (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M6.6 3.5H13M6.6 8H13M6.6 12.5H13" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round"/>
+      <path d="M3.8 8L1.9 6.1M3.8 8L1.9 9.9" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  ),
+};
 
 const LEGEND_ITEMS = [
   ["rgba(16,185,129,0.85)","Норма"],
@@ -6980,15 +7592,20 @@ function SidebarControlMenu({
   modelGroups,
   showLegend, setShowLegend,
   qualitySettings, onQualityChange,
-  onAddStudy, onBackToPatients, onImportGithub,
-  studyDisabled=false,
+  onBackToPatients,
+  defaultCollapsed = false,
+  collapseToken = "",
 }) {
   const initialPos = React.useMemo(() => ({ left:16, top:70 }), []);
-  const [collapsed, setCollapsed] = React.useState(false);
+  const [collapsed, setCollapsed] = React.useState(!!defaultCollapsed);
   const [showQuality, setShowQuality] = React.useState(false);
   const [pos, setPos] = React.useState(initialPos);
   const rootRef = React.useRef(null);
   const dragRef = React.useRef({ active:false, startX:0, startY:0, left:0, top:0 });
+
+  React.useEffect(() => {
+    setCollapsed(!!defaultCollapsed);
+  }, [collapseToken, defaultCollapsed]);
 
   React.useEffect(() => {
     const onMove = e => {
@@ -7110,12 +7727,12 @@ function SidebarControlMenu({
         </button>
       </div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(6, 1fr)",gap:8}}>
-        <TBtn compact icon={<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2L14 5.5L8 9L2 5.5L8 2Z" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" fill="none"/><path d="M2 8.5L8 12L14 8.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/></svg>} label={`Слои${modelGroups.length>0?` (${modelGroups.length})`:""}`} active={showGroupPanel} onClick={()=>setShowGroupPanel(v=>!v)}/>
-        <TBtn compact icon="🩻" label="Рентген" active={xrayMode} onClick={()=>setXrayMode(v=>!v)}/>
-        <TBtn compact icon="📅" label="Хронология" active={showTimeline} onClick={()=>setShowTimeline(v=>!v)}/>
-        <TBtn compact icon="!" label="Пат+Набл" active={criticalOnlyMode} onClick={()=>setCriticalOnlyMode(v=>!v)} accentColor="rgba(249,115,22,0.6)"/>
-        <TBtn compact icon="🏷" label="Легенда" active={showLegend} onClick={()=>setShowLegend(v=>!v)}/>
-        <TBtn compact icon="⚙" label="Качество" active={showQuality} onClick={()=>setShowQuality(v=>!v)}/>
+        <TBtn compact icon={NAV_ICONS.layers} label={`Слои${modelGroups.length>0?` (${modelGroups.length})`:""}`} active={showGroupPanel} onClick={()=>setShowGroupPanel(v=>!v)}/>
+        <TBtn compact icon={NAV_ICONS.xray} label="Рентген" active={xrayMode} onClick={()=>setXrayMode(v=>!v)}/>
+        <TBtn compact icon={NAV_ICONS.timeline} label="Хронология" active={showTimeline} onClick={()=>setShowTimeline(v=>!v)}/>
+        <TBtn compact icon={NAV_ICONS.critical} label="Пат+Набл" active={criticalOnlyMode} onClick={()=>setCriticalOnlyMode(v=>!v)} accentColor="rgba(249,115,22,0.6)"/>
+        <TBtn compact icon={NAV_ICONS.legend} label="Легенда" active={showLegend} onClick={()=>setShowLegend(v=>!v)}/>
+        <TBtn compact icon={NAV_ICONS.quality} label="Качество" active={showQuality} onClick={()=>setShowQuality(v=>!v)}/>
       </div>
       {showLegend && (
         <div style={{marginTop:10,padding:12,background:C.bg3,border:`1px solid ${C.border}`,borderRadius:12}}>
@@ -7127,9 +7744,7 @@ function SidebarControlMenu({
       )}
       <div style={{height:1,background:C.border,margin:"12px 0"}}/>
       <div style={{display:"flex",flexDirection:"column",gap:8}}>
-        <button onClick={onAddStudy} disabled={studyDisabled} style={{...actionBtn(true),opacity:studyDisabled?0.45:1,cursor:studyDisabled?"not-allowed":"pointer"}}><span style={{fontSize:15}}>＋</span><span>Исследование</span></button>
-        <button onClick={onImportGithub} style={actionBtn(false)}><span style={{fontSize:14}}>⇪</span><span>Импорт GitHub</span></button>
-        <button onClick={onBackToPatients} style={actionBtn(false)}><span style={{fontSize:15}}>↪</span><span>К пациентам</span></button>
+        <button onClick={onBackToPatients} style={actionBtn(false)}><span style={{display:"inline-flex",width:16,height:16,alignItems:"center",justifyContent:"center"}}>{NAV_ICONS.patients}</span><span>К пациентам</span></button>
       </div>
     </div>
   );
@@ -7144,8 +7759,7 @@ function MobileOverlayMenu({
   modelGroups,
   showLegend, setShowLegend,
   qualitySettings, onQualityChange,
-  onAddStudy, onBackToPatients, onImportGithub,
-  studyDisabled=false,
+  onBackToPatients,
 }) {
   const [showQuality, setShowQuality] = React.useState(false);
   return (
@@ -7168,12 +7782,12 @@ function MobileOverlayMenu({
           maxHeight:"calc(100dvh - 96px)",overflowY:"auto",
         }}>
           <div style={{display:"grid",gridTemplateColumns:"repeat(6, 1fr)",gap:8}}>
-            <TBtn compact icon={<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2L14 5.5L8 9L2 5.5L8 2Z" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" fill="none"/><path d="M2 8.5L8 12L14 8.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/></svg>} label={`Слои${modelGroups.length>0?` (${modelGroups.length})`:""}`} active={showGroupPanel} onClick={()=>setShowGroupPanel(v=>!v)}/>
-            <TBtn compact icon="🩻" label="Рентген" active={xrayMode} onClick={()=>setXrayMode(v=>!v)}/>
-            <TBtn compact icon="📅" label="Хронология" active={showTimeline} onClick={()=>setShowTimeline(v=>!v)}/>
-            <TBtn compact icon="!" label="Пат+Набл" active={criticalOnlyMode} onClick={()=>setCriticalOnlyMode(v=>!v)} accentColor="rgba(249,115,22,0.6)"/>
-            <TBtn compact icon="🏷" label="Легенда" active={showLegend} onClick={()=>setShowLegend(v=>!v)}/>
-            <TBtn compact icon="⚙" label="Качество" active={showQuality} onClick={()=>setShowQuality(v=>!v)}/>
+            <TBtn compact icon={NAV_ICONS.layers} label={`Слои${modelGroups.length>0?` (${modelGroups.length})`:""}`} active={showGroupPanel} onClick={()=>setShowGroupPanel(v=>!v)}/>
+            <TBtn compact icon={NAV_ICONS.xray} label="Рентген" active={xrayMode} onClick={()=>setXrayMode(v=>!v)}/>
+            <TBtn compact icon={NAV_ICONS.timeline} label="Хронология" active={showTimeline} onClick={()=>setShowTimeline(v=>!v)}/>
+            <TBtn compact icon={NAV_ICONS.critical} label="Пат+Набл" active={criticalOnlyMode} onClick={()=>setCriticalOnlyMode(v=>!v)} accentColor="rgba(249,115,22,0.6)"/>
+            <TBtn compact icon={NAV_ICONS.legend} label="Легенда" active={showLegend} onClick={()=>setShowLegend(v=>!v)}/>
+            <TBtn compact icon={NAV_ICONS.quality} label="Качество" active={showQuality} onClick={()=>setShowQuality(v=>!v)}/>
           </div>
           {showLegend && (
             <div style={{marginTop:10,padding:12,background:C.bg3,border:`1px solid ${C.border}`,borderRadius:12}}>
@@ -7185,9 +7799,7 @@ function MobileOverlayMenu({
           )}
           <div style={{height:1,background:C.border,margin:"12px 0"}}/>
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
-            <button onClick={()=>{ if(studyDisabled) return; setOpen(false); onAddStudy(); }} disabled={studyDisabled} style={{width:"100%",display:"flex",alignItems:"center",gap:10,padding:"10px 12px",background:"linear-gradient(135deg,#2563eb,#0891b2)",color:"#fff",border:"none",borderRadius:10,cursor:studyDisabled?"not-allowed":"pointer",fontSize:12,fontWeight:700,opacity:studyDisabled?0.45:1}}><span style={{fontSize:15}}>＋</span><span>Исследование</span></button>
-            <button onClick={()=>{setOpen(false);onImportGithub&&onImportGithub();}} style={{width:"100%",display:"flex",alignItems:"center",gap:10,padding:"10px 12px",background:"transparent",border:`1px solid ${C.border}`,borderRadius:10,cursor:"pointer",fontSize:12,fontWeight:700,color:C.text}}><span style={{fontSize:14}}>⇪</span><span>Импорт GitHub</span></button>
-            <button onClick={()=>{setOpen(false);onBackToPatients();}} style={{width:"100%",display:"flex",alignItems:"center",gap:10,padding:"10px 12px",background:"transparent",border:`1px solid ${C.border}`,borderRadius:10,cursor:"pointer",fontSize:12,fontWeight:700,color:C.text}}><span style={{fontSize:15}}>↪</span><span>К пациентам</span></button>
+            <button onClick={()=>{setOpen(false);onBackToPatients();}} style={{width:"100%",display:"flex",alignItems:"center",gap:10,padding:"10px 12px",background:"transparent",border:`1px solid ${C.border}`,borderRadius:10,cursor:"pointer",fontSize:12,fontWeight:700,color:C.text}}><span style={{display:"inline-flex",width:16,height:16,alignItems:"center",justifyContent:"center"}}>{NAV_ICONS.patients}</span><span>К пациентам</span></button>
           </div>
         </div>
       )}
@@ -7197,11 +7809,13 @@ function MobileOverlayMenu({
 
 function DoctorDesktop({ user, onLogout }) {
   useDB();
+  const SIDEBAR_ANIM_MS = 320;
   const [sel, setSel] = useState(null);
   const [search, setSearch] = useState("");
   const [showAdd, setShowAdd] = useState(false);
   const [showOrgan, setShowOrgan] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarModelReady, setSidebarModelReady] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(Math.floor(window.innerWidth * 0.65));
   const [selOrgan, setSelOrgan] = useState(null);
   const [navScene, setNavScene] = useState(null);
@@ -7210,11 +7824,12 @@ function DoctorDesktop({ user, onLogout }) {
   const [activeOrganLayer, setActiveOrganLayer] = useState(null);
   const [isolateLayerEnabled, setIsolateLayerEnabled] = useState(false);
   const [qualitySettings, setQualitySettings] = useState(() => loadQualitySettings());
-  const [showGitHubImport, setShowGitHubImport] = useState(false);
   const topbarHeight = 54;
 
   const layerBtnRef = useRef(null);
   const preIsolationGroupVisRef = useRef(null);
+  const sidebarModelTimerRef = useRef(null);
+  const closePatientTimerRef = useRef(null);
   const [modelGroups, setModelGroups] = useState([]);
   const [groupVis, setGroupVis] = useState(() => {
     const v = {}; TARGET_GROUPS.forEach(g => { v[g.name] = g.defaultOn !== false; }); return v;
@@ -7230,6 +7845,22 @@ function DoctorDesktop({ user, onLogout }) {
     saveQualitySettings(safeQuality);
   }, [safeQuality.resolutionScale, safeQuality.raycastIntervalMs, safeQuality.maxInfoCards, safeQuality.renderMode]);
 
+  useEffect(() => {
+    return () => {
+      if (sidebarModelTimerRef.current) clearTimeout(sidebarModelTimerRef.current);
+      if (closePatientTimerRef.current) clearTimeout(closePatientTimerRef.current);
+    };
+  }, []);
+
+  const scheduleSidebarModelMount = useCallback(() => {
+    if (sidebarModelTimerRef.current) clearTimeout(sidebarModelTimerRef.current);
+    setSidebarModelReady(false);
+    sidebarModelTimerRef.current = setTimeout(() => {
+      setSidebarModelReady(true);
+      sidebarModelTimerRef.current = null;
+    }, SIDEBAR_ANIM_MS + 20);
+  }, []);
+
   const restoreGroupVisibility = useCallback(() => {
     const snapshot = preIsolationGroupVisRef.current;
     if (snapshot) {
@@ -7243,8 +7874,11 @@ function DoctorDesktop({ user, onLogout }) {
       setIsolateLayerEnabled(false);
       restoreGroupVisibility();
     }
-    if (name === "__set__" && bulk) { setGroupVis(bulk); return; }
-    setGroupVis(prev => ({ ...prev, [name]: !prev[name] }));
+    if (name === "__set__" && bulk) {
+      setGroupVis(normalizeGroupVisibility(bulk, false));
+      return;
+    }
+    setGroupVis(prev => normalizeGroupVisibility({ ...(prev || {}), [name]: !prev?.[name] }, false));
   };
 
   const patients = dbQuery("SELECT * FROM patients WHERE doctor_id=?", [user.id]);
@@ -7266,18 +7900,32 @@ function DoctorDesktop({ user, onLogout }) {
   };
 
   const pick = (p) => {
+    if (closePatientTimerRef.current) {
+      clearTimeout(closePatientTimerRef.current);
+      closePatientTimerRef.current = null;
+    }
+    const organRows = dbQuery("SELECT organ_id,status FROM organ_data WHERE patient_id=? AND organ_id NOT IN ('__record__','__ai__')", [p.id]);
+    setGroupVis(buildAutoGroupVisibilityForRows(organRows));
     setSel(p);
+    setSidebarOpen(true);
+    scheduleSidebarModelMount();
     setSelOrgan(null);
     setActiveOrganLayer(null);
     setIsolateLayerEnabled(false);
     preIsolationGroupVisRef.current = null;
     setHoverOverlay(null);
     setCardsFrozen(false);
-    setSidebarOpen(true);
+    setShowGroupPanel(false);
   };
 
   const goBack = () => {
-    setSel(null);
+    if (sidebarModelTimerRef.current) {
+      clearTimeout(sidebarModelTimerRef.current);
+      sidebarModelTimerRef.current = null;
+    }
+    setSidebarModelReady(false);
+    setSidebarOpen(false);
+    setShowGroupPanel(false);
     setSelOrgan(null);
     setActiveOrganLayer(null);
     setIsolateLayerEnabled(false);
@@ -7285,7 +7933,11 @@ function DoctorDesktop({ user, onLogout }) {
     setHoverOverlay(null);
     setNavScene(null);
     setCardsFrozen(false);
-    setSidebarOpen(false);
+    if (closePatientTimerRef.current) clearTimeout(closePatientTimerRef.current);
+    closePatientTimerRef.current = setTimeout(() => {
+      setSel(null);
+      closePatientTimerRef.current = null;
+    }, SIDEBAR_ANIM_MS);
   };
 
   const closeOrganTab = () => {
@@ -7379,12 +8031,12 @@ function DoctorDesktop({ user, onLogout }) {
     <div style={{height:"100vh",display:"flex",background:C.bg,overflow:"hidden",position:"relative"}}>
       <div style={{
         position:"absolute",left:0,top:0,bottom:0,width: sidebarOpen ? sidebarWidth : 0,minWidth: sidebarOpen ? 360 : 0,
-        transition: sidebarOpen ? "none" : "width 0.3s cubic-bezier(0.16,1,0.3,1), min-width 0.3s",
+        transition: "width 0.32s cubic-bezier(0.16,1,0.3,1), min-width 0.32s cubic-bezier(0.16,1,0.3,1)",
         overflow:"hidden",display:"flex",flexDirection:"column",background:C.bg,borderRight: sidebarOpen ? `1px solid ${C.border}` : "none",zIndex:3,
       }}>
-        {sidebarOpen && (
+        {sidebarOpen && sel && (
           <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column",minHeight:0,paddingTop:topbarHeight,position:"relative"}}>
-            {sel ? (
+            {sidebarModelReady ? (
               <>
                 <ModelPanel
                   pid={sel.id} gender={sel.gender} isDoctor={true} isMobile={false}
@@ -7414,17 +8066,14 @@ function DoctorDesktop({ user, onLogout }) {
                   showLegend={showLegend} setShowLegend={setShowLegend}
                   qualitySettings={safeQuality}
                   onQualityChange={setQualitySettings}
-                  onAddStudy={()=>setShowOrgan(true)}
-                  onImportGithub={()=>setShowGitHubImport(true)}
                   onBackToPatients={goBack}
-                  studyDisabled={!sel}
+                  defaultCollapsed={true}
+                  collapseToken={sel?.id || ""}
                 />
               </>
             ) : (
-              <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",opacity:0.25,flexDirection:"column",gap:8}}>
-                <svg width="32" height="32" viewBox="0 0 32 32" fill="none"><circle cx="16" cy="8" r="4" stroke="#03C2FC" strokeWidth="1.5"/><path d="M6 32v-5a5 5 0 0 1 5-5h10a5 5 0 0 1 5 5v5" stroke="#03C2FC" strokeWidth="1.5" strokeLinecap="round"/><line x1="16" y1="12" x2="16" y2="22" stroke="#03C2FC" strokeWidth="1.5" strokeLinecap="round"/></svg>
-                <span style={{fontSize:10,color:C.muted}}>Выберите пациента</span>
-                <div style={{width:248,maxWidth:"calc(100% - 32px)"}}>
+              <div style={{flex:1,display:"flex",flexDirection:"column",position:"relative"}}>
+                <div style={{position:"absolute",top:14,left:14}}>
                   <SidebarControlMenu
                     showGroupPanel={showGroupPanel} setShowGroupPanel={setShowGroupPanel}
                     xrayMode={xrayMode} setXrayMode={setXrayMode}
@@ -7434,17 +8083,16 @@ function DoctorDesktop({ user, onLogout }) {
                     showLegend={showLegend} setShowLegend={setShowLegend}
                     qualitySettings={safeQuality}
                     onQualityChange={setQualitySettings}
-                    onAddStudy={()=>setShowOrgan(true)}
-                    onImportGithub={()=>setShowGitHubImport(true)}
-                    onBackToPatients={()=>{ setSel(null); setHoverOverlay(null); }}
-                    studyDisabled={true}
+                    onBackToPatients={goBack}
+                    defaultCollapsed={true}
+                    collapseToken={sel?.id || ""}
                   />
                 </div>
               </div>
             )}
           </div>
         )}
-        {sidebarOpen && (
+        {sidebarOpen && sel && (
           <div onMouseDown={startResize} style={{position:"absolute",right:0,top:0,bottom:0,width:6,cursor:"col-resize",zIndex:10,display:"flex",alignItems:"center",justifyContent:"center"}}
             onMouseEnter={e=>e.currentTarget.children[0]&&(e.currentTarget.children[0].style.opacity="1")}
             onMouseLeave={e=>e.currentTarget.children[0]&&(e.currentTarget.children[0].style.opacity="0.25")}>
@@ -7453,9 +8101,9 @@ function DoctorDesktop({ user, onLogout }) {
         )}
       </div>
 
-      <div style={{height:"100vh",display:"flex",flexDirection:"column",background:C.bg,overflow:"hidden",position:"relative",width:"100%",paddingLeft:sidebarOpen ? sidebarWidth : 0,transition: sidebarOpen ? "none" : "padding-left 0.3s cubic-bezier(0.16,1,0.3,1)"}}>
+      <div style={{height:"100vh",display:"flex",flexDirection:"column",background:C.bg,overflow:"hidden",position:"relative",width:"100%",paddingLeft:sidebarOpen ? sidebarWidth : 0,transition:"padding-left 0.32s cubic-bezier(0.16,1,0.3,1)"}}>
         <div style={{height:topbarHeight,borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",padding:"0 20px",gap:10,flexShrink:0,background:C.bg4,backdropFilter:"blur(8px)",position:"relative",zIndex:4}}>
-          <button onClick={()=>setSidebarOpen(o=>!o)} title={sidebarOpen?"Скрыть панель":"Показать панель"} style={{width:32,height:32,borderRadius:8,flexShrink:0,border:`1.5px solid ${sidebarOpen?"rgba(3,194,252,0.45)":C.border2}`,background:sidebarOpen?"rgba(3,194,252,0.1)":C.surf,color:sidebarOpen?"#03C2FC":C.muted,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",transition:"all 0.2s"}}>
+          <button onClick={()=>{ if(!sel) return; setSidebarOpen(o=>!o); }} disabled={!sel} title={sidebarOpen?"Скрыть панель":"Показать панель"} style={{width:32,height:32,borderRadius:8,flexShrink:0,border:`1.5px solid ${sidebarOpen?"rgba(3,194,252,0.45)":C.border2}`,background:sidebarOpen?"rgba(3,194,252,0.1)":C.surf,color:sidebarOpen?"#03C2FC":C.muted,cursor:!sel?"not-allowed":"pointer",opacity:!sel?0.45:1,display:"flex",alignItems:"center",justifyContent:"center",transition:"all 0.2s"}}>
             <svg width="18" height="14" viewBox="0 0 18 14" fill="none"><rect x="0.75" y="0.75" width="16.5" height="12.5" rx="2.25" stroke="currentColor" strokeWidth="1.5"/><line x1="6" y1="1" x2="6" y2="13" stroke="currentColor" strokeWidth="1.5"/></svg>
           </button>
           <div style={{width:1,height:22,background:C.border,margin:"0 4px",flexShrink:0}}/>
@@ -7539,24 +8187,21 @@ function DoctorDesktop({ user, onLogout }) {
                 <span style={{fontSize:13,fontWeight:700,color:C.text,letterSpacing:"-0.3px"}}>Пациенты</span>
                 <span style={{fontSize:10,color:C.muted,background:C.surf,borderRadius:6,padding:"2px 9px",border:`1px solid ${C.border}`,fontFamily:C.mono}}>{filtered.length}</span>
                 <div style={{flex:1}}/>
-                <div style={{display:"grid",gridTemplateColumns:"3fr 0.7fr 1.2fr 2fr 1fr",width:"calc(100% - 200px)"}}>
-                  {["ФИО","ПОЛ","ВИЗИТ","АДРЕС","БОЛЕЗНЬ"].map(h=>(<span key={h} style={{fontSize:9,fontWeight:700,color:C.muted,letterSpacing:"0.08em",textTransform:"uppercase"}}>{h}</span>))}
+                <div style={{display:"grid",gridTemplateColumns:"3fr 0.8fr 1.2fr 2fr",width:"calc(100% - 200px)"}}>
+                  {["ФИО","ПОЛ","ВИЗИТ","АДРЕС"].map(h=>(<span key={h} style={{fontSize:9,fontWeight:700,color:C.muted,letterSpacing:"0.08em",textTransform:"uppercase"}}>{h}</span>))}
                 </div>
               </div>
               <div style={{flex:1,overflowY:"auto"}}>
                 {filtered.length===0&&(
                   <div style={{padding:"80px",textAlign:"center",color:C.muted,display:"flex",flexDirection:"column",alignItems:"center",gap:12}}>
-                    <div style={{width:64,height:64,borderRadius:20,background:C.surf,border:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:28,opacity:0.5}}>👥</div>
+                    <div style={{width:64,height:64,borderRadius:20,background:C.surf,border:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:28,opacity:0.5}}></div>
                     <div style={{fontSize:14,fontWeight:600,color:C.dim}}>Пациентов нет</div>
                     <div style={{fontSize:12}}>Список пациентов пуст</div>
                   </div>
                 )}
                 {filtered.map(p=>{
-                  const disease = getPatientDiseaseInfo(p.id);
-                  const diseaseText = disease?.name || "—";
-                  const diseaseColor = { sick:C.red2, warning:C.orange2, ok:C.green2, none:"rgba(148,163,184,0.4)" }[disease?.tone || "none"];
                   return (
-                    <div key={p.id} onClick={()=>pick(p)} style={{display:"grid",gridTemplateColumns:"3fr 0.7fr 1.2fr 2fr 1fr",padding:"11px 24px",cursor:"pointer",borderBottom:`1px solid ${C.border}`,alignItems:"center",transition:"background 0.12s",background:"transparent",borderLeft:"3px solid transparent"}}
+                    <div key={p.id} onClick={()=>pick(p)} style={{display:"grid",gridTemplateColumns:"3fr 0.8fr 1.2fr 2fr",padding:"11px 24px",cursor:"pointer",borderBottom:`1px solid ${C.border}`,alignItems:"center",transition:"background 0.12s",background:"transparent",borderLeft:"3px solid transparent"}}
                       onMouseEnter={e=>{e.currentTarget.style.background=C.surfH;e.currentTarget.style.borderLeft=`3px solid rgba(59,130,246,0.3)`;}}
                       onMouseLeave={e=>{e.currentTarget.style.background="transparent";e.currentTarget.style.borderLeft="3px solid transparent";}}>
                       <div style={{display:"flex",alignItems:"center",gap:11,minWidth:0}}>
@@ -7566,10 +8211,9 @@ function DoctorDesktop({ user, onLogout }) {
                           {p.phone&&<div style={{fontSize:10,color:C.muted,marginTop:1,fontFamily:C.mono}}>{p.phone}</div>}
                         </div>
                       </div>
-                      <div style={{fontSize:11,color:p.gender==="female"?"#c084fc":C.blue2,fontWeight:600}}>{p.gender==="female"?"♀":"♂"}</div>
+                      <div style={{fontSize:11,color:p.gender==="female"?"#c084fc":C.blue2,fontWeight:700}}>{p.gender==="female"?"Ж":"М"}</div>
                       <div style={{fontSize:11,color:C.muted,fontFamily:C.mono}}>{p.last_visit||"—"}</div>
                       <div style={{fontSize:12,color:C.muted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.address||"—"}</div>
-                      <div title={diseaseText} style={{fontSize:10,color:diseaseColor,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{diseaseText}</div>
                     </div>
                   );
                 })}
@@ -7592,7 +8236,6 @@ function DoctorDesktop({ user, onLogout }) {
 
         {showAdd&&<AddPatientModal doctorId={user.id} onClose={()=>setShowAdd(false)}/>}
         {showOrgan&&sel&&<AddOrganModal pid={sel.id} onClose={()=>setShowOrgan(false)}/>}
-        {showGitHubImport&&<GitHubImportModal doctorId={user.id} onClose={()=>setShowGitHubImport(false)}/>}
       </div>
     </div>
   );
@@ -7615,14 +8258,16 @@ function DoctorMobile({ user, onLogout }) {
   const [criticalOnlyMode, setCriticalOnlyMode] = useState(false);
   const [showLegend, setShowLegend] = useState(false);
   const [qualitySettings, setQualitySettings] = useState(() => loadQualitySettings());
-  const [showGitHubImport, setShowGitHubImport] = useState(false);
   const [modelGroups, setModelGroups] = useState([]);
   const [groupVis, setGroupVis] = useState(() => {
     const v = {}; TARGET_GROUPS.forEach(g => { v[g.name] = g.defaultOn !== false; }); return v;
   });
   const toggleGroup = (name, bulk) => {
-    if (name === "__set__" && bulk) { setGroupVis(bulk); return; }
-    setGroupVis(prev => ({ ...prev, [name]: !prev[name] }));
+    if (name === "__set__" && bulk) {
+      setGroupVis(normalizeGroupVisibility(bulk, false));
+      return;
+    }
+    setGroupVis(prev => normalizeGroupVisibility({ ...(prev || {}), [name]: !prev?.[name] }, false));
   };
   const safeQuality = clampQualitySettings(qualitySettings);
 
@@ -7659,9 +8304,14 @@ function DoctorMobile({ user, onLogout }) {
             style={{width:"100%",padding:"10px 12px",background:"rgba(255,255,255,0.05)",border:`1.5px solid ${C.border}`,borderRadius:22,fontSize:13,outline:"none",color:C.text,fontFamily:"inherit",boxSizing:"border-box"}}/>
         </div>
         <div style={{flex:1,overflowY:"auto"}}>
-          {filtered.length===0&&<div style={{padding:"60px 20px",textAlign:"center",color:C.muted}}><div style={{fontSize:40,opacity:0.1,marginBottom:12}}>👥</div><div>Пациентов нет</div></div>}
+          {filtered.length===0&&<div style={{padding:"60px 20px",textAlign:"center",color:C.muted}}><div style={{fontSize:40,opacity:0.1,marginBottom:12}}></div><div>Пациентов нет</div></div>}
           {filtered.map(p=>(
-            <div key={p.id} onClick={()=>{setPat(p);setView("patient");}}
+            <div key={p.id} onClick={()=>{
+              const organRows = dbQuery("SELECT organ_id,status FROM organ_data WHERE patient_id=? AND organ_id NOT IN ('__record__','__ai__')", [p.id]);
+              setGroupVis(buildAutoGroupVisibilityForRows(organRows));
+              setPat(p);
+              setView("patient");
+            }}
               style={{padding:"12px 16px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:11,cursor:"pointer"}}>
               {(() => {
                 const disease = getPatientDiseaseInfo(p.id);
@@ -7704,10 +8354,7 @@ function DoctorMobile({ user, onLogout }) {
             showLegend={showLegend} setShowLegend={setShowLegend}
             qualitySettings={safeQuality}
             onQualityChange={setQualitySettings}
-            onAddStudy={()=>setShowOrgan(true)}
-            onImportGithub={()=>setShowGitHubImport(true)}
             onBackToPatients={()=>{ setPat(null); setView("list"); }}
-            studyDisabled={!pat}
           />
 
           <div style={{position:"absolute",inset:0}}>
@@ -7730,7 +8377,6 @@ function DoctorMobile({ user, onLogout }) {
 
       {showAdd&&<AddPatientModal doctorId={user.id} onClose={()=>setShowAdd(false)}/>}
       {showOrgan&&pat&&<AddOrganModal pid={pat.id} onClose={()=>setShowOrgan(false)}/>}
-      {showGitHubImport&&<GitHubImportModal doctorId={user.id} onClose={()=>setShowGitHubImport(false)}/>}
     </div>
   );
 }
@@ -7744,7 +8390,7 @@ function PatientDesktop({ user, onLogout }) {
 
   if (!patient) return (
     <div style={{height:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:14,color:C.muted}}>
-      <div style={{fontSize:42,opacity:0.12}}>🧑</div>
+      <div style={{fontSize:42,opacity:0.12}}></div>
       <div style={{fontSize:14}}>Ваши данные не найдены</div>
       <div style={{fontSize:12,color:C.muted}}>Обратитесь к врачу для создания карточки</div>
       <button onClick={onLogout} style={{padding:"9px 22px",background:C.blue,color:"#fff",border:"none",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:700}}>Выйти</button>
@@ -7763,15 +8409,15 @@ function PatientDesktop({ user, onLogout }) {
         <div>
           <div style={{fontSize:14,fontWeight:700,color:C.text,letterSpacing:"-0.3px"}}>{patient.name}</div>
           <div style={{fontSize:10,color:C.muted,display:"flex",gap:8,marginTop:1}}>
-            <span>{patient.gender==="female"?"♀ Женский":"♂ Мужской"}</span>
+            <span>{patient.gender==="female"?" Женский":" Мужской"}</span>
             {patient.dob&&<span style={{fontFamily:C.mono}}>· {patient.dob}</span>}
           </div>
         </div>
         {/* status summary badges */}
         <div style={{display:"flex",gap:8,marginLeft:8}}>
-          {sickCount>0&&<div style={{padding:"3px 10px",borderRadius:12,background:"rgba(239,68,68,0.12)",color:C.red2,fontSize:10,fontWeight:700,border:`1px solid rgba(239,68,68,0.22)`,letterSpacing:"0.02em"}}>⚠ Патологии: {sickCount}</div>}
+          {sickCount>0&&<div style={{padding:"3px 10px",borderRadius:12,background:"rgba(239,68,68,0.12)",color:C.red2,fontSize:10,fontWeight:700,border:`1px solid rgba(239,68,68,0.22)`,letterSpacing:"0.02em"}}> Патологии: {sickCount}</div>}
           {warnCount>0&&<div style={{padding:"3px 10px",borderRadius:12,background:"rgba(249,115,22,0.1)",color:C.orange2,fontSize:10,fontWeight:700,border:`1px solid rgba(249,115,22,0.2)`}}>Наблюдение: {warnCount}</div>}
-          {okCount>0&&<div style={{padding:"3px 10px",borderRadius:12,background:"rgba(16,185,129,0.08)",color:C.green2,fontSize:10,fontWeight:700,border:`1px solid rgba(16,185,129,0.18)`}}>✓ Норма: {okCount}</div>}
+          {okCount>0&&<div style={{padding:"3px 10px",borderRadius:12,background:"rgba(16,185,129,0.08)",color:C.green2,fontSize:10,fontWeight:700,border:`1px solid rgba(16,185,129,0.18)`}}> Норма: {okCount}</div>}
         </div>
         <div style={{flex:1}}/>
         <button onClick={onLogout} style={{display:"flex",alignItems:"center",gap:5,padding:"7px 14px",background:C.surf,color:C.dim,border:`1px solid ${C.border}`,borderRadius:10,cursor:"pointer",fontSize:11,fontWeight:600,letterSpacing:"0.02em"}}
@@ -7791,7 +8437,7 @@ function PatientMobile({ user, onLogout }) {
   const patient = dbGetOne("SELECT * FROM patients WHERE user_id=?", [user.id]);
   if (!patient) return (
     <div style={{height:"100dvh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:12,color:C.muted}}>
-      <div style={{fontSize:34,opacity:0.14}}>🧑</div>
+      <div style={{fontSize:34,opacity:0.14}}></div>
       <div style={{fontSize:13}}>Данные не найдены</div>
       <button onClick={onLogout} style={{padding:"8px 20px",background:C.blue,color:"#fff",border:"none",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:700}}>Выйти</button>
     </div>
@@ -7802,7 +8448,7 @@ function PatientMobile({ user, onLogout }) {
         <HuMapperLogo size={24}/>
         <div style={{flex:1}}>
           <div style={{fontSize:13,fontWeight:700,color:C.text}}>{patient.name}</div>
-          <div style={{fontSize:9,color:C.muted}}>{patient.gender==="female"?"♀":"♂"} · {patient.dob||"—"}</div>
+          <div style={{fontSize:9,color:C.muted}}>{patient.gender==="female"?"":""} · {patient.dob||"—"}</div>
         </div>
         <button onClick={onLogout} style={{padding:"5px 10px",background:C.surf,border:`1px solid ${C.border}`,borderRadius:7,cursor:"pointer",color:C.dim,fontSize:10}}>Выйти</button>
       </div>
@@ -7874,7 +8520,7 @@ function Auth({ onLogin }) {
         <div style={{padding:"22px 28px 26px"}}>
           {/* Role selector */}
           <div style={{display:"flex",gap:8,marginBottom:16}}>
-            {[["doctor","👨‍⚕️  Врач"],["patient","🧑  Пациент"]].map(([id,l])=>(
+            {[["doctor","‍  Врач"],["patient","  Пациент"]].map(([id,l])=>(
               <button key={id} onClick={()=>setRole(id)} style={{flex:1,padding:"10px",border:`2px solid ${role===id?C.blue:C.border2}`,borderRadius:11,cursor:"pointer",background:role===id?C.accent:C.surf,color:role===id?C.blue2:C.dim,fontWeight:600,fontSize:12,transition:"all 0.2s"}}>{l}</button>
             ))}
           </div>
@@ -7883,7 +8529,7 @@ function Auth({ onLogin }) {
             <input style={inputStyle} placeholder="ФИО полностью" value={form.name} onChange={e=>setForm({...form,name:e.target.value})}/>
             {role==="doctor"&&<input style={inputStyle} placeholder="Специализация" value={form.spec} onChange={e=>setForm({...form,spec:e.target.value})}/>}
             {role==="patient"&&<div style={{display:"flex",gap:8,marginBottom:10}}>
-              {[["male","♂ Мужской"],["female","♀ Женский"]].map(([id,l])=>(
+              {[["male"," Мужской"],["female"," Женский"]].map(([id,l])=>(
                 <button key={id} onClick={()=>setGender(id)} style={{flex:1,padding:"9px",border:`2px solid ${gender===id?C.blue:C.border2}`,borderRadius:9,cursor:"pointer",background:gender===id?C.accent:C.surf,color:gender===id?C.blue2:C.dim,fontWeight:600,fontSize:12}}>{l}</button>
               ))}
             </div>}
@@ -7893,7 +8539,7 @@ function Auth({ onLogin }) {
           <input style={inputStyle} type="password" placeholder="Пароль" value={form.pw} onChange={e=>setForm({...form,pw:e.target.value})} onKeyDown={e=>e.key==="Enter"&&submit()}/>
           {mode==="register"&&<input style={inputStyle} type="password" placeholder="Повторите пароль" value={form.confirm} onChange={e=>setForm({...form,confirm:e.target.value})}/>}
 
-          {err&&<div style={{marginBottom:12,padding:"10px 14px",background:"rgba(239,68,68,0.08)",color:C.red2,borderRadius:10,fontSize:12,border:`1px solid rgba(239,68,68,0.2)`}}>⚠ {err}</div>}
+          {err&&<div style={{marginBottom:12,padding:"10px 14px",background:"rgba(239,68,68,0.08)",color:C.red2,borderRadius:10,fontSize:12,border:`1px solid rgba(239,68,68,0.2)`}}> {err}</div>}
 
           <button onClick={submit} style={{width:"100%",padding:"13px",background:"linear-gradient(135deg,#2563eb,#0891b2)",color:"#fff",border:"none",borderRadius:12,fontSize:14,fontWeight:700,cursor:"pointer",boxShadow:"0 4px 20px rgba(37,99,235,0.35)",letterSpacing:"0.02em",marginBottom:16}}
             onMouseEnter={e=>e.target.style.opacity="0.88"} onMouseLeave={e=>e.target.style.opacity="1"}>
@@ -7902,8 +8548,8 @@ function Auth({ onLogin }) {
 
           {/* Demo credentials */}
           <div style={{background:C.bg3,borderRadius:12,padding:"13px 16px",border:`1px solid ${C.border}`}}>
-            <div style={{fontSize:9,fontWeight:700,color:C.muted,marginBottom:10,letterSpacing:"0.08em",textTransform:"uppercase"}}>🔑 Демо-доступ</div>
-            {[["dr@demo.com","demo","👨‍⚕️  Смирнов А.В. — Врач-терапевт"],["p@demo.com","demo","🧑  Демо Пациент (с данными)"]].map(([e,pw,l])=>(
+            <div style={{fontSize:9,fontWeight:700,color:C.muted,marginBottom:10,letterSpacing:"0.08em",textTransform:"uppercase"}}> Демо-доступ</div>
+            {[["dr@demo.com","demo","‍  Смирнов А.В. — Врач-терапевт"],["p@demo.com","demo","  Демо Пациент (с данными)"]].map(([e,pw,l])=>(
               <div key={e} onClick={()=>setForm(f=>({...f,email:e,pw}))}
                 style={{padding:"7px 10px",borderRadius:8,cursor:"pointer",fontSize:12,color:C.blue2,fontWeight:500,transition:"background 0.15s"}}
                 onMouseEnter={ev=>ev.currentTarget.style.background=C.accent}

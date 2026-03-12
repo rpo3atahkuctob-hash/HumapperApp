@@ -77,6 +77,15 @@ ORANGE_HINTS = (
     "follow up",
     "abnormal",
 )
+NEGATION_HINTS = (
+    "no evidence of",
+    "without evidence",
+    "negative for",
+    "ruled out",
+    "excluded",
+    "no ",
+    "without ",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,6 +163,20 @@ def infer_organ_id(text: str) -> str:
 
 def infer_color(text: str) -> str:
     lowered = (text or "").lower()
+    if any(k in lowered for k in NEGATION_HINTS):
+        return "gray"
+    if "(morphologic abnormality)" in lowered or "(morphological abnormality)" in lowered:
+        return "red"
+    if "(disorder)" in lowered:
+        return "red"
+    if "(person)" in lowered:
+        return "gray"
+    if "(procedure)" in lowered:
+        return "gray"
+    if "(situation)" in lowered:
+        return "orange"
+    if "(finding)" in lowered:
+        return "orange"
     if any(k in lowered for k in RED_HINTS):
         return "red"
     if any(k in lowered for k in ORANGE_HINTS):
@@ -409,4 +432,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

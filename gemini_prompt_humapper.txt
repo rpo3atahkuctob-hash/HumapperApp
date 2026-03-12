@@ -18,26 +18,53 @@ Output schema:
   ]
 }
 
+Evidence basis (must follow):
+- SNOMED CT semantic tags: "disorder" is an abnormal clinical state; "finding" is an observation/assessment;
+  "situation with explicit context" carries context (history/family/risk/planned/etc.);
+  "morphologic abnormality" denotes pathological morphology context.
+- HL7 FHIR Condition status logic:
+  clinical_status(active/recurrence/relapse/inactive/remission/resolved),
+  verification_status(unconfirmed/provisional/differential/confirmed/refuted/entered-in-error).
+
 Core rules (high priority):
-1) If diagnosis explicitly contains "(disorder)" or the standalone term "disorder" and it is NOT negated, map to severity="sick".
-2) If diagnosis contains "(finding)" or "finding":
-   - use "warning" by default,
-   - upgrade to "sick" only when finding clearly indicates acute/severe pathology.
-3) Respect negation and exclusion cues. If text says no pathology / ruled out / absent / negative, do not assign "sick".
-4) If text contains status fields (FHIR/SNOMED style), apply:
+1) Semantic-tag triage (when phrase ends with "(...)"):
+   - "(disorder)" -> severity="sick" by default (if not negated).
+   - "(morphologic abnormality)" or "(morphological abnormality)" -> severity="sick" (if not negated).
+   - "(finding)" -> severity="warning" by default.
+   - "(situation)" -> severity="warning" by default (context/risk/history/planned); do not auto-upgrade to sick without acute evidence.
+   - "(procedure)" -> usually not a diagnosis; use "warning" only when complication/adverse pathology is explicit, otherwise skip.
+   - "(person)" -> not a diagnosis; skip unless explicitly used as pathology context (rare).
+
+2) FHIR status override (stronger than default tag):
    - clinical_status: active|recurrence|relapse -> sick
    - clinical_status: inactive|remission -> warning
-   - clinical_status: resolved -> healthy (unless persistent complication is stated)
+   - clinical_status: resolved -> healthy (unless persistent active complication is explicitly present)
    - verification_status: confirmed -> keep current severity
-   - verification_status: provisional|differential|unconfirmed|suspected|possible -> warning (unless emergency signs)
+   - verification_status: provisional|differential|unconfirmed|suspected|possible -> cap at warning (unless emergency red flags)
    - verification_status: refuted|entered-in-error -> healthy or skip
-5) Always classify confirmed malignant neoplasm/cancer/tumor as "sick" for involved organ(s).
-6) Typical emergency red flags => "sick": infarction, stroke, sepsis, shock, acute respiratory failure, acute kidney/liver failure,
-   pulmonary embolism, active major bleeding, perforation, acute fracture/dislocation.
-7) Chronic stable/controlled conditions and follow-up states => "warning".
-8) Clearly normal organ statements => "healthy".
-9) Use only allowed organ ids. If unsure about organ mapping, skip that organ instead of inventing ids.
-10) No duplicates in results. Confidence must be 0.55..0.99.
+
+3) Negation/absence always de-escalates:
+   if statement is clearly absent/negative/ruled-out/no-evidence, do not output sick.
+
+4) Emergency/pathology escalation to sick:
+   infarction, stroke, sepsis, shock, acute respiratory failure, acute renal/hepatic failure,
+   pulmonary embolism, active major bleeding, perforation, acute fracture/dislocation,
+   confirmed malignant neoplasm/cancer/tumor.
+
+5) Organ mapping safety:
+   - Use only allowed organ ids.
+   - Map organ only if anatomically/clinically justified by the same statement.
+   - NEVER assign a default organ (especially never default to heart).
+   - If organ cannot be mapped reliably, skip that item instead of inventing organ ids.
+
+6) Non-clinical social/context statements:
+   education level, transport access, housing, occupation/service, administrative context, etc.
+   are not direct organ pathology. Classify as warning only if clinically relevant risk is explicit; otherwise skip.
+
+7) Deduplication/confidence:
+   - No duplicates.
+   - Confidence range 0.55..0.99.
+   - Higher confidence for explicit semantic tag + explicit organ + explicit status markers.
 
 Language handling:
 - Input can be English or Russian.
