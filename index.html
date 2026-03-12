@@ -7995,14 +7995,24 @@ function DoctorDesktop({ user, onLogout }) {
   }, [sidebarOpen, sel]);
 
   useEffect(() => {
+    const isCtrl = (e) => e.key === "Control" || e.code === "ControlLeft" || e.code === "ControlRight";
     const onKeyDown = (e) => {
-      if (e.repeat) return;
-      if ((e.key === "Control" || e.code === "ControlLeft" || e.code === "ControlRight") && !e.altKey && !e.metaKey && !e.shiftKey) {
-        setCardsFrozen(prev => !prev);
-      }
+      if (!isCtrl(e) || e.altKey || e.metaKey || e.shiftKey) return;
+      setCardsFrozen(true);
     };
+    const onKeyUp = (e) => {
+      if (!isCtrl(e)) return;
+      setCardsFrozen(false);
+    };
+    const onBlur = () => setCardsFrozen(false);
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+    };
   }, []);
 
   useEffect(() => {
@@ -8117,19 +8127,6 @@ function DoctorDesktop({ user, onLogout }) {
               style={{width:"100%",padding:"9px 14px 9px 34px",background:C.surf,border:`1.5px solid ${C.border}`,borderRadius:22,fontSize:13,outline:"none",color:C.text,fontFamily:"inherit",boxSizing:"border-box",transition:"all 0.2s",letterSpacing:"0.01em"}}
               onFocus={e=>{e.target.style.borderColor="rgba(59,130,246,0.5)";e.target.style.background=C.accent;}} onBlur={e=>{e.target.style.borderColor=C.border;e.target.style.background=C.surf;}}/>
           </div>
-          <div style={{
-            padding:"5px 10px",
-            borderRadius:999,
-            border:`1px solid ${cardsFrozen ? "rgba(59,130,246,0.45)" : C.border}`,
-            background:cardsFrozen ? "rgba(59,130,246,0.12)" : C.surf,
-            color:cardsFrozen ? C.blue2 : C.muted,
-            fontSize:10,
-            fontWeight:700,
-            letterSpacing:"0.04em",
-            whiteSpace:"nowrap",
-          }}>
-            Ctrl {cardsFrozen ? "фикс" : "свободно"}
-          </div>
         </div>
 
         {sidebarOpen && sel && navScene && (
@@ -8183,12 +8180,9 @@ function DoctorDesktop({ user, onLogout }) {
         <div style={{flex:1,display:"flex",overflow:"hidden",position:"relative"}}>
           {!sel&&(
             <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}} className="fade-in">
-              <div style={{padding:"10px 24px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:10,background:C.bg4,flexShrink:0}}>
-                <span style={{fontSize:13,fontWeight:700,color:C.text,letterSpacing:"-0.3px"}}>Пациенты</span>
-                <span style={{fontSize:10,color:C.muted,background:C.surf,borderRadius:6,padding:"2px 9px",border:`1px solid ${C.border}`,fontFamily:C.mono}}>{filtered.length}</span>
-                <div style={{flex:1}}/>
-                <div style={{display:"grid",gridTemplateColumns:"3fr 0.8fr 1.2fr 2fr",width:"calc(100% - 200px)"}}>
-                  {["ФИО","ПОЛ","ВИЗИТ","АДРЕС"].map(h=>(<span key={h} style={{fontSize:9,fontWeight:700,color:C.muted,letterSpacing:"0.08em",textTransform:"uppercase"}}>{h}</span>))}
+              <div style={{padding:"10px 24px",borderBottom:`1px solid ${C.border}`,background:C.bg4,flexShrink:0}}>
+                <div style={{display:"grid",gridTemplateColumns:"3fr 0.8fr 1.2fr 2fr",alignItems:"center"}}>
+                  {["ФИО","ПОЛ","ВИЗИТ","АДРЕС"].map((h, idx)=>(<span key={h} style={{fontSize:9,fontWeight:700,color:C.muted,letterSpacing:"0.08em",textTransform:"uppercase",paddingLeft:idx===0?47:0}}>{h}</span>))}
                 </div>
               </div>
               <div style={{flex:1,overflowY:"auto"}}>
@@ -8292,8 +8286,7 @@ function DoctorMobile({ user, onLogout }) {
         <div style={{height:56,display:"flex",alignItems:"center",padding:"0 16px",gap:10,flexShrink:0,background:C.bg4,borderBottom:`1px solid ${C.border}`}}>
           <HuMapperLogo size={26}/>
           <div style={{flex:1}}>
-            <div style={{fontSize:14,fontWeight:700,color:C.text}}>Пациенты</div>
-            <div style={{fontSize:9,color:C.muted}}>{user.spec||"Врач"}</div>
+            <div style={{fontSize:12,fontWeight:600,color:C.muted}}>{user.spec||"Врач"}</div>
           </div>
           <button onClick={()=>setShowAdd(true)} style={{width:34,height:34,borderRadius:10,background:"linear-gradient(135deg,#2563eb,#0891b2)",border:"none",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,color:"#fff"}}>+</button>
           <button onClick={onLogout} style={{width:34,height:34,borderRadius:10,background:C.surf,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",color:C.text,fontSize:14}}>↪</button>
