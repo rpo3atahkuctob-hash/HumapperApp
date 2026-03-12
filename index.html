@@ -90,24 +90,309 @@ const { useState, useEffect, useRef, useCallback, useMemo } = React;
    SQL DATABASE LAYER
 ═══════════════════════════════════════════════ */
 let sqlDB = null;
+let sqlModule = null;
 let dbReady = false;
 const dbReadyCallbacks = [];
+const DB_STORAGE_KEY_LEGACY = "medvis_db";
+const DB_IDB_NAME = "humapper_store_v1";
+const DB_IDB_STORE = "kv";
+const DB_IDB_KEY = "medvis_db_bin";
+const DB_LOCALSTORAGE_MAX_BYTES = 1200000;
+const CLOUD_SYNC_META_KEY = "humapper_cloud_meta_v1";
+const CLOUD_SYNC_DEBOUNCE_MS = 1400;
+const cloudSyncState = {
+  activeDoctorKey: "",
+  timer: null,
+  inFlight: false,
+  pending: false,
+};
 
 function onDbReady(fn) {
   if (dbReady) fn();
   else dbReadyCallbacks.push(fn);
 }
 
+function isQuotaExceededError(err) {
+  if (!err) return false;
+  return err.name === "QuotaExceededError" || err.code === 22 || err.code === 1014;
+}
+
+function openPersistStore() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") {
+      reject(new Error("IndexedDB unavailable"));
+      return;
+    }
+    const req = indexedDB.open(DB_IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(DB_IDB_STORE)) db.createObjectStore(DB_IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error("IndexedDB open failed"));
+  });
+}
+
+function idbSetValue(key, value) {
+  return openPersistStore().then(db => new Promise((resolve, reject) => {
+    let settled = false;
+    const finalize = (fn) => {
+      if (settled) return;
+      settled = true;
+      try { db.close(); } catch (_) {}
+      fn();
+    };
+    const tx = db.transaction(DB_IDB_STORE, "readwrite");
+    tx.objectStore(DB_IDB_STORE).put(value, key);
+    tx.oncomplete = () => finalize(() => resolve(true));
+    tx.onabort = () => finalize(() => reject(tx.error || new Error("IndexedDB write aborted")));
+    tx.onerror = () => finalize(() => reject(tx.error || new Error("IndexedDB write failed")));
+  }));
+}
+
+function idbGetValue(key) {
+  return openPersistStore().then(db => new Promise((resolve, reject) => {
+    let settled = false;
+    const finalize = (fn) => {
+      if (settled) return;
+      settled = true;
+      try { db.close(); } catch (_) {}
+      fn();
+    };
+    const tx = db.transaction(DB_IDB_STORE, "readonly");
+    const req = tx.objectStore(DB_IDB_STORE).get(key);
+    req.onsuccess = () => finalize(() => resolve(req.result ?? null));
+    req.onerror = () => finalize(() => reject(req.error || new Error("IndexedDB read failed")));
+    tx.onabort = () => finalize(() => reject(tx.error || new Error("IndexedDB read aborted")));
+    tx.onerror = () => finalize(() => reject(tx.error || new Error("IndexedDB read tx failed")));
+  }));
+}
+
+function asUint8Array(value) {
+  if (!value) return null;
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (Array.isArray(value)) return new Uint8Array(value);
+  return null;
+}
+
+function persistDbBytes(bytes) {
+  const safe = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  if (!safe.length) return;
+  if (safe.byteLength <= DB_LOCALSTORAGE_MAX_BYTES) {
+    try {
+      localStorage.setItem(DB_STORAGE_KEY_LEGACY, JSON.stringify(Array.from(safe)));
+      return;
+    } catch (e) {
+      if (!isQuotaExceededError(e)) {
+        console.error("DB persist localStorage failed:", e);
+        return;
+      }
+    }
+  }
+  const ab = safe.buffer.slice(safe.byteOffset, safe.byteOffset + safe.byteLength);
+  idbSetValue(DB_IDB_KEY, ab)
+    .then(() => {
+      try { localStorage.removeItem(DB_STORAGE_KEY_LEGACY); } catch (_) {}
+    })
+    .catch(e => console.error("DB persist IndexedDB failed:", e));
+}
+
+async function loadPersistedDbBytes() {
+  try {
+    const fromIdb = asUint8Array(await idbGetValue(DB_IDB_KEY));
+    if (fromIdb && fromIdb.length) return fromIdb;
+  } catch (e) {
+    console.warn("DB load from IndexedDB skipped:", e);
+  }
+  try {
+    const saved = localStorage.getItem(DB_STORAGE_KEY_LEGACY);
+    if (!saved) return null;
+    return asUint8Array(JSON.parse(saved));
+  } catch (e) {
+    console.warn("DB load from localStorage skipped:", e);
+    try { localStorage.removeItem(DB_STORAGE_KEY_LEGACY); } catch (_) {}
+    return null;
+  }
+}
+
+function uint8ToBase64(bytes) {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  if (!arr.length) return "";
+  const CHUNK = 0x8000;
+  let out = "";
+  for (let i = 0; i < arr.length; i += CHUNK) {
+    out += String.fromCharCode.apply(null, arr.subarray(i, i + CHUNK));
+  }
+  return btoa(out);
+}
+
+function base64ToUint8(base64) {
+  const raw = atob(String(base64 || ""));
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+function readCloudMeta() {
+  try {
+    const raw = localStorage.getItem(CLOUD_SYNC_META_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function writeCloudMeta(next) {
+  try {
+    localStorage.setItem(CLOUD_SYNC_META_KEY, JSON.stringify(next || {}));
+  } catch (_) {}
+}
+
+function normalizeDoctorCloudKey(user) {
+  if (!user || user.role !== "doctor") return "";
+  const base = String(user.email || user.id || "").trim().toLowerCase();
+  return base.slice(0, 190);
+}
+
+function setCloudSyncUser(user) {
+  cloudSyncState.activeDoctorKey = normalizeDoctorCloudKey(user);
+}
+
+async function sha256Hex(bytes) {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  if (!arr.length || !window.crypto?.subtle) return "";
+  const digest = await window.crypto.subtle.digest("SHA-256", arr);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function scheduleCloudPush(delayMs = CLOUD_SYNC_DEBOUNCE_MS) {
+  if (!cloudSyncState.activeDoctorKey) return;
+  if (cloudSyncState.timer) clearTimeout(cloudSyncState.timer);
+  cloudSyncState.timer = setTimeout(() => {
+    cloudSyncState.timer = null;
+    cloudPushNow(false);
+  }, Math.max(300, Number(delayMs) || CLOUD_SYNC_DEBOUNCE_MS));
+}
+
+async function cloudPushNow(force = false) {
+  const doctorKey = cloudSyncState.activeDoctorKey;
+  if (!doctorKey || !sqlDB) return { ok: false, reason: "inactive" };
+  if (cloudSyncState.inFlight) {
+    cloudSyncState.pending = true;
+    return { ok: false, reason: "busy" };
+  }
+
+  cloudSyncState.inFlight = true;
+  try {
+    const bytes = sqlDB.export();
+    if (!bytes?.length) return { ok: false, reason: "empty" };
+
+    const sha = await sha256Hex(bytes);
+    const meta = readCloudMeta();
+    const prevSha = String(meta?.[doctorKey]?.lastPushedSha || "");
+    if (!force && sha && prevSha === sha) return { ok: true, skipped: true };
+
+    const db_b64 = uint8ToBase64(bytes);
+    const resp = await fetch(`/api/cloud-db/${encodeURIComponent(doctorKey)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        db_b64,
+        db_sha256: sha || "",
+        client_ts: new Date().toISOString()
+      })
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      throw new Error(txt || `cloud_push_${resp.status}`);
+    }
+    const payload = await resp.json().catch(() => ({}));
+    const nextMeta = readCloudMeta();
+    nextMeta[doctorKey] = {
+      lastPushedSha: String(payload?.db_sha256 || sha || ""),
+      lastRemoteUpdatedAt: String(payload?.updated_at || new Date().toISOString()),
+    };
+    writeCloudMeta(nextMeta);
+    return { ok: true };
+  } catch (e) {
+    console.warn("[HuMapper] cloud push failed:", e);
+    return { ok: false, reason: "exception", error: String(e?.message || e) };
+  } finally {
+    cloudSyncState.inFlight = false;
+    if (cloudSyncState.pending) {
+      cloudSyncState.pending = false;
+      scheduleCloudPush(800);
+    }
+  }
+}
+
+async function cloudPullForUser(user) {
+  const doctorKey = normalizeDoctorCloudKey(user);
+  if (!doctorKey || !sqlModule || !sqlDB) return { ok: false, reason: "inactive" };
+
+  try {
+    const resp = await fetch(`/api/cloud-db/${encodeURIComponent(doctorKey)}`, { cache: "no-store" });
+    if (resp.status === 404) return { ok: false, reason: "empty_remote" };
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      throw new Error(txt || `cloud_pull_${resp.status}`);
+    }
+    const remote = await resp.json();
+    const remoteB64 = String(remote?.db_b64 || "");
+    if (!remoteB64) return { ok: false, reason: "invalid_remote" };
+    const remoteBytes = base64ToUint8(remoteB64);
+    if (!remoteBytes.length) return { ok: false, reason: "invalid_remote_bytes" };
+
+    const localSha = await sha256Hex(sqlDB.export());
+    const remoteSha = String(remote?.db_sha256 || "");
+    if (localSha && remoteSha && localSha === remoteSha) {
+      const m0 = readCloudMeta();
+      m0[doctorKey] = {
+        lastPushedSha: remoteSha,
+        lastRemoteUpdatedAt: String(remote?.updated_at || new Date().toISOString()),
+      };
+      writeCloudMeta(m0);
+      return { ok: true, skipped: true, reason: "same_hash" };
+    }
+
+    const meta = readCloudMeta();
+    const lastKnown = Date.parse(String(meta?.[doctorKey]?.lastRemoteUpdatedAt || ""));
+    const remoteTs = Date.parse(String(remote?.updated_at || ""));
+    if (Number.isFinite(lastKnown) && Number.isFinite(remoteTs) && remoteTs <= lastKnown) {
+      return { ok: true, skipped: true, reason: "remote_not_newer" };
+    }
+
+    const nextMeta = readCloudMeta();
+    nextMeta[doctorKey] = {
+      lastPushedSha: remoteSha || "",
+      lastRemoteUpdatedAt: String(remote?.updated_at || new Date().toISOString()),
+    };
+    writeCloudMeta(nextMeta);
+
+    sqlDB = new sqlModule.Database(remoteBytes);
+    ensureAppSchema();
+    saveDB();
+    pub("organ_updated", { source: "cloud_pull", doctorKey });
+    return { ok: true, replaced: true };
+  } catch (e) {
+    console.warn("[HuMapper] cloud pull failed:", e);
+    return { ok: false, reason: "exception", error: String(e?.message || e) };
+  }
+}
+
 async function initDB() {
   const SQL = await initSqlJs({
     locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.2/${f}`
   });
+  sqlModule = SQL;
   
-  // Load from localStorage if exists
-  const saved = localStorage.getItem('medvis_db');
-  if (saved) {
-    const arr = new Uint8Array(JSON.parse(saved));
-    sqlDB = new SQL.Database(arr);
+  // Load from persisted storage (IndexedDB preferred, localStorage legacy fallback)
+  const persisted = await loadPersistedDbBytes();
+  if (persisted && persisted.length) {
+    sqlDB = new SQL.Database(persisted);
   } else {
     sqlDB = new SQL.Database();
     sqlDB.run(`
@@ -168,7 +453,8 @@ async function initDB() {
 function saveDB() {
   if (!sqlDB) return;
   const data = sqlDB.export();
-  localStorage.setItem('medvis_db', JSON.stringify(Array.from(data)));
+  persistDbBytes(data);
+  scheduleCloudPush();
 }
 
 function dbQuery(sql, params = []) {
@@ -338,6 +624,84 @@ function statusToSignal(status) {
   if (status === "warning") return "orange";
   if (status === "healthy") return "gray";
   return "gray";
+}
+
+function normalizeDiseaseTitle(raw) {
+  let t = String(raw || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  const nl = t.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  if (nl.length) t = nl[0];
+  const firstSentence = t.split(/[.;]/).map(x => x.trim()).find(Boolean);
+  if (firstSentence) t = firstSentence;
+  t = t.replace(/\((?:disorder|finding|procedure)\)/ig, "").trim();
+  t = t.replace(/^screening for\s+/i, "").trim();
+  t = t.replace(/^suspected\s+/i, "").trim();
+  t = t.replace(/^history of\s+/i, "").trim();
+  t = t.replace(/\s{2,}/g, " ").trim();
+  if (t.length > 72) t = `${t.slice(0, 69)}…`;
+  return t;
+}
+
+function getPatientDiseaseInfo(pid) {
+  const tl = dbGetOne(
+    `SELECT conclusion, color, date_iso, id
+     FROM timeline_items
+     WHERE patient_id=? AND IFNULL(conclusion,'')<>''
+     ORDER BY
+       CASE color
+         WHEN 'red' THEN 0
+         WHEN 'orange' THEN 1
+         WHEN 'yellow' THEN 2
+         WHEN 'blue' THEN 3
+         ELSE 4
+       END,
+       date_iso DESC,
+       id DESC
+     LIMIT 1`,
+    [pid]
+  );
+  if (tl?.conclusion) {
+    return {
+      name: normalizeDiseaseTitle(tl.conclusion),
+      tone: tl.color === "red" ? "sick" : tl.color === "orange" ? "warning" : tl.color === "blue" ? "none" : "ok",
+    };
+  }
+
+  const od = dbGetOne(
+    `SELECT findings, status, id
+     FROM organ_data
+     WHERE patient_id=?
+       AND organ_id NOT IN ('__record__','__ai__')
+       AND IFNULL(findings,'')<>''
+     ORDER BY
+       CASE status
+         WHEN 'sick' THEN 0
+         WHEN 'warning' THEN 1
+         WHEN 'healthy' THEN 2
+         ELSE 3
+       END,
+       id DESC
+     LIMIT 1`,
+    [pid]
+  );
+  if (od?.findings) {
+    const tone = od.status === "sick" ? "sick" : od.status === "warning" ? "warning" : od.status === "healthy" ? "ok" : "none";
+    return { name: normalizeDiseaseTitle(od.findings), tone };
+  }
+
+  const ai = dbGetOne("SELECT findings FROM organ_data WHERE patient_id=? AND organ_id='__ai__'", [pid]);
+  if (ai?.findings) {
+    try {
+      const payload = JSON.parse(ai.findings);
+      const first = Array.isArray(payload?.results) ? payload.results.find(r => r?.disease) : null;
+      if (first?.disease) {
+        const tone = first?.severity === "sick" ? "sick" : first?.severity === "warning" ? "warning" : "ok";
+        return { name: normalizeDiseaseTitle(first.disease), tone };
+      }
+    } catch (_) {}
+  }
+
+  return { name: "", tone: "none" };
 }
 
 function normalizeTimelineDateIso(raw, fallbackNow = false) {
@@ -628,6 +992,30 @@ function importGitHubDatasetV1(dataset, doctorId = 1) {
   return report;
 }
 
+async function autoImportLocalDatasetV1(doctorId = 1) {
+  try {
+    const patientCount = Number(dbGetOne("SELECT COUNT(*) AS c FROM patients")?.c || 0);
+    const timelineCount = Number(dbGetOne("SELECT COUNT(*) AS c FROM timeline_items")?.c || 0);
+    if (timelineCount > 0 || patientCount > 2) {
+      return { ok: false, skipped: true, reason: "db_not_empty" };
+    }
+    const resp = await fetch("./dataset.json", { cache: "no-store" });
+    if (!resp.ok) {
+      return { ok: false, skipped: true, reason: `http_${resp.status}` };
+    }
+    const dataset = await resp.json();
+    const validation = validateGitHubDatasetV1(dataset);
+    if (!validation.ok) {
+      return { ok: false, skipped: true, reason: "invalid_schema", errors: validation.errors };
+    }
+    const report = importGitHubDatasetV1(dataset, doctorId);
+    return { ok: true, report };
+  } catch (e) {
+    console.warn("[HuMapper] local dataset auto-import skipped:", e);
+    return { ok: false, skipped: true, reason: "exception", error: String(e?.message || e) };
+  }
+}
+
 /* ═══════════════════════════════════════════════
    SYNC / PUBSUB
 ═══════════════════════════════════════════════ */
@@ -777,6 +1165,22 @@ const ORGAN_ID_ALIASES = {
   // lymph legacy
   lymph_nodes_cervical:    "lymph_nodes_head_neck",
   lymph_nodes_inguinal:    "lymph_nodes_lower_limb",
+  // common generic IDs from AI/imports
+  lungs:                   "lung",
+  kidneys:                 "kidney",
+  renal:                   "kidney",
+  left_kidney:             "kidney_left",
+  right_kidney:            "kidney_right",
+  pancreatic:              "pancreas",
+  pancreatic_gland:        "pancreas",
+  pancreas_gland:          "pancreas",
+  // RU fallbacks (AI may return Russian labels)
+  "лёгкие":                "lung",
+  "легкие":                "lung",
+  "почка":                 "kidney",
+  "почки":                 "kidney",
+  "поджелудочная":         "pancreas",
+  "поджелудочная_железа":  "pancreas",
   // joints / bones — mirror server aliases
   temporomandibular_joint: "tmj",
   jaw_joint:               "tmj",
@@ -801,8 +1205,18 @@ const ORGAN_ID_ALIASES = {
   foot_joint:              "foot_joints",
 };
 
+const ORGAN_ID_EXPANSIONS = {
+  lung:   ["lung_left", "lung_right"],
+  kidney: ["kidney_left", "kidney_right"],
+  ovary:  ["ovary_left", "ovary_right"],
+  testis: ["testis_left", "testis_right"],
+};
+
 function canonicalizeOrganId(id) {
-  const key = String(id || "").trim();
+  const key = String(id || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
   return ORGAN_ID_ALIASES[key] || key;
 }
 
@@ -1178,10 +1592,13 @@ function canonicalizeOrganMap(map) {
   Object.entries(map || {}).forEach(([rawId, status]) => {
     const id = canonicalizeOrganId(rawId);
     if (!id) return;
-    const cur = out[id];
-    if (!cur || (priority[status] ?? -1) > (priority[cur] ?? -1)) {
-      out[id] = status;
-    }
+    const targets = ORGAN_ID_EXPANSIONS[id] || [id];
+    targets.forEach(targetId => {
+      const cur = out[targetId];
+      if (!cur || (priority[status] ?? -1) > (priority[cur] ?? -1)) {
+        out[targetId] = status;
+      }
+    });
   });
   return out;
 }
@@ -1564,6 +1981,19 @@ function mergeAnalysisToOrgans(results) {
   return canonicalizeOrganMap(map);
 }
 
+function inferStatusFromConclusionText(text) {
+  const src = String(text || "").trim();
+  if (!src) return "none";
+  const t = src.toLowerCase();
+  const hasNegation = /(no evidence of|without evidence|negative for|rule(?:d)? out|excluded|without|нет признаков|без признаков|исключ(?:ено|ён|ена)|не выявлено)/i.test(src);
+  if (hasNegation) return "healthy";
+  if (/malignant neoplasm|carcinoma|adenocarcinoma|sarcoma|lymphoma|leukemia|cancer|рак|карцинома|злокачеств/i.test(t)) return "sick";
+  if (/\(disorder\)|\bdisorder\b/i.test(src)) return "sick";
+  if (/\(finding\)|\bfinding\b/i.test(src)) return "warning";
+  if (/(acute|остр[а-я]+)\s+(infar|stroke|sepsis|failure|bleed|fracture|bronchitis|pneumonia|панкреатит|инфаркт|инсульт|сепсис|недостаточност|кровотеч|перелом|пневмон)/i.test(t)) return "sick";
+  return "none";
+}
+
 function inferMajorOrganIdFromMeshName(meshName, cat="visceral") {
   const raw = String(meshName || "");
   const n = normalizeMeshName(raw);
@@ -1581,6 +2011,8 @@ function inferMajorOrganIdFromMeshName(meshName, cat="visceral") {
     if (has(/coronary|anterior interventricular|circumflex artery of heart|great cardiac vein|middle cardiac vein|coronary sinus/)) return "coronary_vessels";
     if (has(/\bheart\b|atrium|ventricle|pericard|myocard|endocard|epicard|atrioventricular valve|pulmonary valve|aortic valve|mitral|tricuspid|papillary muscle|chordae|trabeculae/)) return "heart";
     if (has(/pulmonary trunk|pulmonary artery|pulmonary vein|lingular artery|segmental artery of left lung|segmental artery of right lung|vein of right lung|vein of left lung/)) return "pulmonary_vessels";
+    if (has(/renal artery|renal vein|intrarenal|suprarenal/)) return right ? "kidney_right" : left ? "kidney_left" : "kidney";
+    if (has(/pancreaticoduodenal|pancreatic artery|pancreatic vein|pancreatic/)) return "pancreas";
     if (has(/aortic arch|thoracic aorta|ascending aorta|aorta\b|brachiocephalic trunk/)) return "aorta";
     if (has(/carotid|thyroid artery|facial artery|maxillary artery|occipital artery|temporal artery|ophthalmic artery|ethmoidal artery|labial artery|inferior alveolar artery|infra orbital artery|infra-orbital artery|sphenopalatine|palatine artery|mental branch|submental artery|ascending pharyngeal/)) {
       return has(/thyroid/) ? "thyroid" : "carotid_vessels";
@@ -1615,7 +2047,7 @@ function inferMajorOrganIdFromMeshName(meshName, cat="visceral") {
     if (has(/parathyroid/)) return "parathyroid";
     if (has(/oesophagus|esophagus/)) return "esophagus";
     if (has(/bronchus|bronchi/)) return "trachea";
-    if (has(/lung/)) return left ? "lung_left" : right ? "lung_right" : null;
+    if (has(/lung/)) return left ? "lung_left" : right ? "lung_right" : "lung";
     if (has(/stomach|gastric/)) return "stomach";
     if (has(/duodenum|jejunum|ileum|small intestine/)) return "small_intestine";
     if (has(/colon|caec|cecum|appendix|sigmoid|rectum|large intestine|taenia/)) return "large_intestine";
@@ -1623,7 +2055,7 @@ function inferMajorOrganIdFromMeshName(meshName, cat="visceral") {
     if (has(/gallbladder|bile duct/)) return "gallbladder";
     if (has(/pancrea/)) return "pancreas";
     if (has(/\bspleen\b/)) return "spleen";
-    if (has(/kidney|renal|ureter/)) return right ? "kidney_right" : left ? "kidney_left" : null;
+    if (has(/kidney|renal|ureter/)) return right ? "kidney_right" : left ? "kidney_left" : "kidney";
     if (has(/bladder|vesical|urethra/)) return "bladder";
     if (has(/prostat/)) return "prostate";
     if (has(/testis|epididymis/)) return right ? "testis_right" : left ? "testis_left" : null;
@@ -1731,6 +2163,22 @@ function getMeshClinicalEntry(meshName, cat, odMap) {
   const majorId = canonicalizeOrganId(inferMajorOrganIdFromMeshName(meshName, cat));
   if (majorId && odMap[majorId]) {
     return { ...odMap[majorId], organ_id: majorId, _derivedFrom: majorId };
+  }
+  if (majorId) {
+    const sidedFallback = {
+      lung_left: "lung",
+      lung_right: "lung",
+      kidney_left: "kidney",
+      kidney_right: "kidney",
+      ovary_left: "ovary",
+      ovary_right: "ovary",
+      testis_left: "testis",
+      testis_right: "testis",
+    };
+    const baseId = sidedFallback[majorId];
+    if (baseId && odMap[baseId]) {
+      return { ...odMap[baseId], organ_id: majorId, _derivedFrom: baseId };
+    }
   }
 
   const legacyId = inferMajorOrganIdFromMeshName(meshName, cat);
@@ -3027,13 +3475,24 @@ if (xr) {
     lymphoid:       { op: isFocus ? 0.25 : 0.12, factor: 0.50 },
     nervous:        { op: isFocus ? 0.23 : 0.11, factor: 0.50 },
     skin:           { op: isFocus ? 0.10 : 0.03, factor: 1.00 },
-    visceral:       { op: isFocus ? 0.44 : 0.29, factor: 0.50 },
+    visceral:       { op: isFocus ? 0.40 : 0.24, factor: 0.35 },
   };
   const xp = xrayPalette[cat] || xrayPalette.visceral;
-  const xrayStatusOpacity = ((isFocus ? 0.42 : 0.24) * xp.factor);
   const isCriticalStatus = stNow === "sick" || stNow === "warning";
   if (stNow && stNow !== "none") {
-    mats.forEach(mat => setMat(mat, STATUS_HEX[stNow] ?? STATUS_HEX.none, xrayStatusOpacity, false));
+    const xrayStatusOpacity = isCriticalStatus
+      ? (isFocus ? 0.74 : 0.58)
+      : (isFocus ? 0.48 : 0.34);
+    mats.forEach(mat => {
+      setMat(mat, STATUS_HEX[stNow] ?? STATUS_HEX.none, xrayStatusOpacity, false);
+      if (mat && mat.emissive) {
+        mat.emissive.setHex(
+          stNow === "sick" ? 0x2b0a10 :
+          stNow === "warning" ? 0x332009 :
+          stNow === "healthy" ? 0x0a2b18 : 0x000000
+        );
+      }
+    });
   } else {
     mats.forEach(mat => {
       if (!mat) return;
@@ -3064,7 +3523,8 @@ mats.forEach(mat => {
 
   const od3  = clinicalEntry;
   const st   = od3?.status || "none";
-  const disp = (od3?._nlpUpgrade && !od3?._nlp) ? od3._nlpUpgrade : st;
+  // Use the same effective status as hover cards/xray to avoid label-color mismatch.
+  const disp = od3?._nlpUpgrade || st;
 
   const normalOpacity = {
     skeletal:       { active: isFocus ? 0.48 : 0.34, none: isFocus ? 0.22 : 0.12, depthWrite: true  },
@@ -4218,7 +4678,7 @@ function ScanCard({ status, label }) {
 ═══════════════════════════════════════════════ */
 
 // Shared textarea with live NLP analysis badge
-function NLPNotesEditor({ value, onChange, onSave, onCancel, saved, placeholder="Введите диагноз, назначения, рекомендации..." }) {
+function NLPNotesEditor({ value, onChange, onSave, onCancel, saved, placeholder="Введите назначения и рекомендации..." }) {
   const { results, organMap, isAnalyzing } = useTextAnalysis(value);
   return (
     <div>
@@ -4400,7 +4860,7 @@ function OrganDetail({ pid, oid, isDoctor }) {
           {/* doctor notes */}
           {isDoctor ? (
             <div>
-              <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}>💊 Рекомендации / Диагноз врача</div>
+              <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}>💊 Рекомендации врача</div>
               {editing||!notes ? (
                 <NLPNotesEditor
                   value={notes}
@@ -5958,11 +6418,13 @@ function FloatingModelWindow({ patient, onClose, onAddStudy, onOrganSelect, selO
 /* ═══════════════════════════════════════════════
    COLLAPSIBLE ORGAN CARD — proper component so hooks work
 ═══════════════════════════════════════════════ */
-function OrganCard({ r, radNotes, saveRadNote }) {
+function OrganCard({ r, radNotes, saveRadNote, aiState = "idle" }) {
   const [expanded, setExpanded] = useState(false);
   const sc2 = {sick:C.red2,warning:C.orange2,healthy:C.green2}[r.status]||"rgba(3,194,252,0.5)";
   let lv = {}; try { lv = JSON.parse(r.lab_values||"{}"); } catch{}
   const stLabel = {sick:"Патология",warning:"Наблюдение",healthy:"Норма"}[r.status]||"Нет данных";
+  const aiLabel = aiState==="analyzing" ? "Gemini анализирует…" : aiState==="synced" ? "Gemini синхронизирован" : aiState==="error" ? "Gemini недоступен" : "Gemini: ожидание";
+  const aiColor = aiState==="analyzing" ? C.blue2 : aiState==="synced" ? C.green2 : aiState==="error" ? C.red2 : C.muted;
 
   return (
     <div style={{marginBottom:6,background:C.bg3,borderRadius:10,border:`1px solid ${r.status==="sick"?"rgba(239,68,68,0.22)":r.status==="warning"?"rgba(249,115,22,0.18)":C.border}`,overflow:"hidden"}}>
@@ -5993,7 +6455,10 @@ function OrganCard({ r, radNotes, saveRadNote }) {
             </div>
           )}
           <div>
-            <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:5}}>Заключение</div>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginBottom:5}}>
+              <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase"}}>Заключение</div>
+              <div style={{fontSize:8,color:aiColor,fontWeight:700,letterSpacing:"0.03em"}}>{aiLabel}</div>
+            </div>
             <textarea rows={3}
               placeholder={`Заключение по ${OM[r.organ_id]?.n||r.organ_id}...`}
               value={radNotes[`${r.study_type}_${r.organ_id}`] ?? (r.findings||"")}
@@ -6010,7 +6475,7 @@ function OrganCard({ r, radNotes, saveRadNote }) {
 
 /* ═══════════════════════════════════════════════
    PATIENT OVERVIEW PANEL
-   Studies sorted alpha + symptoms/diagnosis/treatment
+   Studies sorted alpha + symptoms/treatment
 ═══════════════════════════════════════════════ */
 function PatientRecord({
   patient,
@@ -6030,14 +6495,14 @@ function PatientRecord({
   const recRow = dbGetOne("SELECT * FROM organ_data WHERE patient_id=? AND organ_id='__record__'", [patient.id]);
   let recData = {};
   try { recData = JSON.parse(recRow?.findings || "{}"); } catch{}
-  const [fields, setFields] = useState({ symptoms: recData.symptoms||"", diagnosis: recData.diagnosis||"", treatment: recData.treatment||"" });
+  const [fields, setFields] = useState({ symptoms: recData.symptoms||"", treatment: recData.treatment||"" });
   const [radNotes, setRadNotes] = useState(() => { try { return recData.radNotes||{}; } catch{return{};} });
 
   // Reload when patient changes
   useEffect(() => {
     const r = dbGetOne("SELECT * FROM organ_data WHERE patient_id=? AND organ_id='__record__'", [patient.id]);
     let d = {}; try { d = JSON.parse(r?.findings || "{}"); } catch{}
-    setFields({ symptoms:d.symptoms||"", diagnosis:d.diagnosis||"", treatment:d.treatment||"" });
+    setFields({ symptoms:d.symptoms||"", treatment:d.treatment||"" });
     setRadNotes(d.radNotes || {});
     setAiLiveState("idle");
   }, [patient.id]);
@@ -6045,7 +6510,14 @@ function PatientRecord({
   const persistRecordSnapshot = (nextFields = fields, nextRadNotes = radNotes) => {
     const curRow = dbGetOne("SELECT * FROM organ_data WHERE patient_id=? AND organ_id='__record__'", [patient.id]);
     let curData = {}; try { curData = JSON.parse(curRow?.findings || "{}"); } catch{}
-    const json = JSON.stringify({ ...curData, ...nextFields, radNotes: nextRadNotes });
+    const snapshot = {
+      ...curData,
+      symptoms: nextFields?.symptoms || "",
+      treatment: nextFields?.treatment || "",
+      radNotes: nextRadNotes || {},
+    };
+    delete snapshot.diagnosis;
+    const json = JSON.stringify(snapshot);
     if (curRow) {
       dbRun("UPDATE organ_data SET findings=?,study_date=? WHERE patient_id=? AND organ_id='__record__'",
         [json, new Date().toLocaleDateString('ru-RU'), patient.id]);
@@ -6057,6 +6529,16 @@ function PatientRecord({
 
   // All organ studies sorted alphabetically by study_type
   const organRows = dbQuery("SELECT * FROM organ_data WHERE patient_id=? AND organ_id NOT IN ('__record__','__ai__')", [patient.id]);
+  const aiOverlayRow = dbGetOne("SELECT * FROM organ_data WHERE patient_id=? AND organ_id='__ai__'", [patient.id]);
+  let aiOverlayData = {};
+  try { aiOverlayData = JSON.parse(aiOverlayRow?.findings || "{}"); } catch {}
+  const aiOverlayMap = canonicalizeOrganMap(aiOverlayData.organMap || {});
+  const STATUS_PRIORITY = { sick: 3, warning: 2, healthy: 1, none: 0 };
+  const resolveDisplayStatus = (baseStatus, organId) => {
+    const b = String(baseStatus || "none");
+    const a = String(aiOverlayMap?.[organId] || "");
+    return (STATUS_PRIORITY[a] ?? 0) > (STATUS_PRIORITY[b] ?? 0) ? a : b;
+  };
   const grouped = {};
   organRows.forEach(r => {
     const key = r.study_type || "Без типа";
@@ -6070,7 +6552,7 @@ function PatientRecord({
     setRadNotes(updated);
   };
 
-  // Autosave doctor notes / symptoms / diagnosis
+  // Autosave doctor notes / symptoms / treatment
   useEffect(() => {
     const t = setTimeout(() => {
       persistRecordSnapshot(fields, radNotes);
@@ -6079,17 +6561,34 @@ function PatientRecord({
       setTimeout(()=>setSaved(false), 1000);
     }, 320);
     return () => clearTimeout(t);
-  }, [patient.id, fields.symptoms, fields.diagnosis, fields.treatment, JSON.stringify(radNotes)]);
+  }, [patient.id, fields.symptoms, fields.treatment, JSON.stringify(radNotes)]);
 
-  // Realtime AI analysis -> dedicated __ai__ overlay row, never overwrites manual study rows
+  const organFindingsSignature = organRows.map(r => `${r.id||""}|${r.organ_id||""}|${r.study_type||""}|${r.findings||""}`).join("||");
+
+  // Realtime AI analysis from conclusions + symptoms + treatment
   useEffect(() => {
     let cancelled = false;
     const t = setTimeout(async () => {
+      const studyKeys = new Set();
+      const conclusionChunks = [];
+      organRows.forEach(r => {
+        const key = `${r.study_type || ""}_${r.organ_id || ""}`;
+        studyKeys.add(key);
+        const fromCard = String(radNotes?.[key] ?? "").trim();
+        const fromDb = String(r?.findings || "").trim();
+        if (fromCard) conclusionChunks.push(fromCard);
+        else if (fromDb) conclusionChunks.push(fromDb);
+      });
+      Object.entries(radNotes || {}).forEach(([k, v]) => {
+        if (studyKeys.has(k)) return;
+        const txt = String(v || "").trim();
+        if (txt) conclusionChunks.push(txt);
+      });
+
       const liveText = [
         fields.symptoms || "",
-        fields.diagnosis || "",
         fields.treatment || "",
-        ...Object.values(radNotes || {})
+        ...conclusionChunks
       ].join("\n").trim();
 
       if (!liveText || liveText.length < 4) {
@@ -6103,6 +6602,17 @@ function PatientRecord({
       try {
         const results = await analyzeText(liveText);
         const organMap = mergeAnalysisToOrgans(results || []);
+        organRows.forEach(r => {
+          const key = `${r.study_type || ""}_${r.organ_id || ""}`;
+          const txt = String(radNotes?.[key] ?? r?.findings ?? "").trim();
+          const heur = inferStatusFromConclusionText(txt);
+          if (!heur || heur === "none") return;
+          const oid = canonicalizeOrganId(r.organ_id);
+          if (!oid) return;
+          if ((STATUS_PRIORITY[heur] ?? 0) > (STATUS_PRIORITY[organMap[oid]] ?? 0)) {
+            organMap[oid] = heur;
+          }
+        });
         if (cancelled) return;
 
         const payload = JSON.stringify({
@@ -6128,7 +6638,7 @@ function PatientRecord({
     }, 650);
 
     return () => { cancelled = true; clearTimeout(t); };
-  }, [patient.id, fields.symptoms, fields.diagnosis, fields.treatment, JSON.stringify(radNotes)]);
+  }, [patient.id, fields.symptoms, fields.treatment, JSON.stringify(radNotes), organFindingsSignature]);
 
   const fieldStyle = {
     width:"100%", padding:"10px 13px",
@@ -6140,8 +6650,9 @@ function PatientRecord({
 
   // Current organ tab data
   const activeOrganData = activeOrganTab ? dbGetOne("SELECT * FROM organ_data WHERE patient_id=? AND organ_id=?", [patient.id, activeOrganTab]) : null;
+  const activeOrganStatus = resolveDisplayStatus(activeOrganData?.status, activeOrganData?.organ_id);
   const activeMeta = activeOrganTab ? OM[activeOrganTab] : null;
-  const sc = activeOrganData ? ({sick:C.red2,warning:C.orange2,healthy:C.green2}[activeOrganData.status]||C.muted) : C.muted;
+  const sc = activeOrganData ? ({sick:C.red2,warning:C.orange2,healthy:C.green2}[activeOrganStatus]||C.muted) : C.muted;
 
   return (
     <div style={{flex:1,display:"flex",flexDirection:"column",height:"100%",overflow:"hidden",background:C.bg}}>
@@ -6219,32 +6730,30 @@ function PatientRecord({
                 <div style={{fontSize:11,color:C.muted,marginTop:4}}>Нажмите «+ Исследование» для добавления</div>
               </div>
             ) : organRows.map(r => (
-              <OrganCard key={r.organ_id} r={r} radNotes={radNotes} saveRadNote={saveRadNote}/>
+              <OrganCard
+                key={r.organ_id}
+                r={{ ...r, status: resolveDisplayStatus(r.status, r.organ_id) }}
+                radNotes={radNotes}
+                saveRadNote={saveRadNote}
+                aiState={aiLiveState}
+              />
             ))}
 
             {/* ─ Symptoms ─ */}
             <div style={{marginBottom:16}}>
-              <div style={{fontSize:9,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:7}}>Симптомы</div>
-              <textarea rows={3} placeholder="Жалобы, симптомы пациента..." value={fields.symptoms}
-                onChange={e=>setFields(f=>({...f,symptoms:e.target.value}))} style={fieldStyle}
-                onFocus={e=>e.target.style.borderColor="rgba(59,130,246,0.5)"} onBlur={e=>e.target.style.borderColor=C.border2}/>
-            </div>
-
-            {/* ─ Diagnosis ─ */}
-            <div style={{marginBottom:16}}>
               <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:7}}>
-                <div style={{fontSize:9,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase"}}>Диагноз</div>
+                <div style={{fontSize:9,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase"}}>Симптомы</div>
                 <div style={{
                   fontSize:9,fontWeight:700,padding:"4px 8px",borderRadius:999,
                   background: aiLiveState==="analyzing" ? "rgba(59,130,246,0.12)" : aiLiveState==="synced" ? "rgba(16,185,129,0.12)" : aiLiveState==="error" ? "rgba(239,68,68,0.12)" : "rgba(148,180,220,0.06)",
                   color: aiLiveState==="analyzing" ? C.blue2 : aiLiveState==="synced" ? C.green2 : aiLiveState==="error" ? C.red2 : C.muted,
                   border:`1px solid ${aiLiveState==="analyzing" ? "rgba(59,130,246,0.25)" : aiLiveState==="synced" ? "rgba(16,185,129,0.25)" : aiLiveState==="error" ? "rgba(239,68,68,0.25)" : C.border}`
                 }}>
-                  {aiLiveState==="analyzing" ? "ИИ анализирует…" : aiLiveState==="synced" ? "Модель обновлена" : aiLiveState==="error" ? "ИИ недоступен" : "Ожидание ввода"}
+                  {aiLiveState==="analyzing" ? "Gemini анализирует…" : aiLiveState==="synced" ? "Модель обновлена" : aiLiveState==="error" ? "Gemini недоступен" : "Ожидание ввода"}
                 </div>
               </div>
-              <textarea rows={3} placeholder="Клинический диагноз (МКБ-10). Модель перекрашивается автоматически в реальном времени." value={fields.diagnosis}
-                onChange={e=>setFields(f=>({...f,diagnosis:e.target.value}))} style={fieldStyle}
+              <textarea rows={3} placeholder="Жалобы, симптомы пациента..." value={fields.symptoms}
+                onChange={e=>setFields(f=>({...f,symptoms:e.target.value}))} style={fieldStyle}
                 onFocus={e=>e.target.style.borderColor="rgba(59,130,246,0.5)"} onBlur={e=>e.target.style.borderColor=C.border2}/>
             </div>
 
@@ -6272,7 +6781,7 @@ function PatientRecord({
         {activeOrganTab&&activeMeta&&(
           <div className="fade-in">
             {/* Organ header */}
-            <div style={{display:"flex",alignItems:"center",gap:13,marginBottom:18,padding:"14px 16px",background:activeOrganData?.status==="sick"?"rgba(239,68,68,0.05)":activeOrganData?.status==="warning"?"rgba(249,115,22,0.04)":"rgba(16,185,129,0.03)",borderRadius:12,border:`1px solid ${sc}20`}}>
+            <div style={{display:"flex",alignItems:"center",gap:13,marginBottom:18,padding:"14px 16px",background:activeOrganStatus==="sick"?"rgba(239,68,68,0.05)":activeOrganStatus==="warning"?"rgba(249,115,22,0.04)":"rgba(16,185,129,0.03)",borderRadius:12,border:`1px solid ${sc}20`}}>
               <div style={{width:46,height:46,borderRadius:13,background:`${sc}12`,border:`1.5px solid ${sc}28`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0}}>
                 {activeMeta.e}
               </div>
@@ -6281,7 +6790,7 @@ function PatientRecord({
                 {activeOrganData
                   ? <div style={{fontSize:11,color:sc,fontWeight:600,marginTop:3,display:"flex",alignItems:"center",gap:6}}>
                       <div style={{width:6,height:6,borderRadius:"50%",background:sc,boxShadow:`0 0 5px ${sc}`}}/>
-                      {({sick:"Патология",warning:"Наблюдение",healthy:"Норма"})[activeOrganData.status]||activeOrganData.status}
+                      {({sick:"Патология",warning:"Наблюдение",healthy:"Норма"})[activeOrganStatus]||activeOrganStatus}
                       {activeOrganData.study_type&&<span style={{color:C.muted,fontWeight:400}}>· {activeOrganData.study_type}</span>}
                       {activeOrganData.study_date&&<span style={{color:C.muted,fontFamily:C.mono,fontWeight:400,fontSize:10}}>{activeOrganData.study_date}</span>}
                     </div>
@@ -6302,12 +6811,12 @@ function PatientRecord({
               <div>
                 {/* Scans */}
                 <div style={{marginBottom:16}}>
-                  <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:8}}>Снимки</div>
-                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-                    <ScanCard status={activeOrganData.status} label="Срез A"/>
-                    <ScanCard status={activeOrganData.status} label="Срез B"/>
+                    <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:8}}>Снимки</div>
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                    <ScanCard status={activeOrganStatus} label="Срез A"/>
+                    <ScanCard status={activeOrganStatus} label="Срез B"/>
+                    </div>
                   </div>
-                </div>
                 {/* Lab values */}
                 {(()=>{let lv={};try{lv=JSON.parse(activeOrganData.lab_values||"{}");}catch{}return Object.keys(lv).length>0&&(
                   <div style={{marginBottom:16}}>
@@ -7031,7 +7540,7 @@ function DoctorDesktop({ user, onLogout }) {
                 <span style={{fontSize:10,color:C.muted,background:C.surf,borderRadius:6,padding:"2px 9px",border:`1px solid ${C.border}`,fontFamily:C.mono}}>{filtered.length}</span>
                 <div style={{flex:1}}/>
                 <div style={{display:"grid",gridTemplateColumns:"3fr 0.7fr 1.2fr 2fr 1fr",width:"calc(100% - 200px)"}}>
-                  {["ФИО","ПОЛ","ВИЗИТ","АДРЕС","СТАТУС"].map(h=>(<span key={h} style={{fontSize:9,fontWeight:700,color:C.muted,letterSpacing:"0.08em",textTransform:"uppercase"}}>{h}</span>))}
+                  {["ФИО","ПОЛ","ВИЗИТ","АДРЕС","БОЛЕЗНЬ"].map(h=>(<span key={h} style={{fontSize:9,fontWeight:700,color:C.muted,letterSpacing:"0.08em",textTransform:"uppercase"}}>{h}</span>))}
                 </div>
               </div>
               <div style={{flex:1,overflowY:"auto"}}>
@@ -7043,9 +7552,9 @@ function DoctorDesktop({ user, onLogout }) {
                   </div>
                 )}
                 {filtered.map(p=>{
-                  const st = getPatientStatus(p.id);
-                  const stLabel = {sick:"Патология",warning:"Наблюдение",ok:"Норма",none:"Нет данных"}[st];
-                  const stColor = {sick:C.red2,warning:C.orange2,ok:C.green2,none:"rgba(148,163,184,0.4)"}[st];
+                  const disease = getPatientDiseaseInfo(p.id);
+                  const diseaseText = disease?.name || "—";
+                  const diseaseColor = { sick:C.red2, warning:C.orange2, ok:C.green2, none:"rgba(148,163,184,0.4)" }[disease?.tone || "none"];
                   return (
                     <div key={p.id} onClick={()=>pick(p)} style={{display:"grid",gridTemplateColumns:"3fr 0.7fr 1.2fr 2fr 1fr",padding:"11px 24px",cursor:"pointer",borderBottom:`1px solid ${C.border}`,alignItems:"center",transition:"background 0.12s",background:"transparent",borderLeft:"3px solid transparent"}}
                       onMouseEnter={e=>{e.currentTarget.style.background=C.surfH;e.currentTarget.style.borderLeft=`3px solid rgba(59,130,246,0.3)`;}}
@@ -7060,7 +7569,7 @@ function DoctorDesktop({ user, onLogout }) {
                       <div style={{fontSize:11,color:p.gender==="female"?"#c084fc":C.blue2,fontWeight:600}}>{p.gender==="female"?"♀":"♂"}</div>
                       <div style={{fontSize:11,color:C.muted,fontFamily:C.mono}}>{p.last_visit||"—"}</div>
                       <div style={{fontSize:12,color:C.muted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.address||"—"}</div>
-                      <div style={{display:"flex",alignItems:"center",gap:5}}>{statusDot(st)}<span style={{fontSize:10,color:stColor,fontWeight:600}}>{stLabel}</span></div>
+                      <div title={diseaseText} style={{fontSize:10,color:diseaseColor,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{diseaseText}</div>
                     </div>
                   );
                 })}
@@ -7123,7 +7632,6 @@ function DoctorMobile({ user, onLogout }) {
 
   const patients = dbQuery("SELECT * FROM patients WHERE doctor_id=?", [user.id]);
   const filtered = patients.filter(p => p.name?.toLowerCase().includes(search.toLowerCase()));
-  const hasSick = (pid) => dbQuery("SELECT 1 FROM organ_data WHERE patient_id=? AND status='sick'", [pid]).length > 0;
 
   useEffect(()=>{
     if(view !== "patient") {
@@ -7155,13 +7663,22 @@ function DoctorMobile({ user, onLogout }) {
           {filtered.map(p=>(
             <div key={p.id} onClick={()=>{setPat(p);setView("patient");}}
               style={{padding:"12px 16px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:11,cursor:"pointer"}}>
+              {(() => {
+                const disease = getPatientDiseaseInfo(p.id);
+                const diseaseText = disease?.name || "—";
+                const diseaseColor = { sick:C.red2, warning:C.orange2, ok:C.green2, none:C.muted }[disease?.tone || "none"];
+                return (
+                  <>
               <div style={{width:42,height:42,borderRadius:"50%",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:700,color:"#fff",background:p.gender==="female"?"linear-gradient(135deg,#9333ea,#7c3aed)":"linear-gradient(135deg,#2563eb,#1d4ed8)"}}>{p.name?.split(" ").map(w=>w[0]).join("").slice(0,2)}</div>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontSize:13,fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</div>
                 <div style={{fontSize:11,color:C.muted,marginTop:2}}>{p.address||"—"}</div>
-                {hasSick(p.id)&&<div style={{fontSize:10,color:C.red2,fontWeight:600,marginTop:2}}>⚠ Патологии выявлены</div>}
+                <div title={diseaseText} style={{fontSize:10,color:diseaseColor,fontWeight:600,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{diseaseText}</div>
               </div>
               <div style={{fontSize:10,color:C.muted}}>{p.last_visit||"—"}</div>
+                  </>
+                );
+              })()}
             </div>
           ))}
         </div>
@@ -7308,10 +7825,14 @@ function Auth({ onLogin }) {
   const [form, setForm] = useState({email:"",pw:"",name:"",confirm:"",spec:""});
   const [err, setErr] = useState("");
 
-  const submit = () => {
+  const submit = async () => {
     setErr("");
     if (mode==="login") {
-      const u = dbGetOne("SELECT * FROM users WHERE email=? AND pw=?", [form.email, form.pw]);
+      let u = dbGetOne("SELECT * FROM users WHERE email=? AND pw=?", [form.email, form.pw]);
+      if (!u && form.email) {
+        await cloudPullForUser({ role: "doctor", email: form.email });
+        u = dbGetOne("SELECT * FROM users WHERE email=? AND pw=?", [form.email, form.pw]);
+      }
       if (!u) return setErr("Неверный email или пароль");
       onLogin(u);
     } else {
@@ -7404,19 +7925,59 @@ function App() {
   const isMobile = window.innerWidth < 768;
 
   useEffect(() => {
-    initDB().then(() => {
+    let cancelled = false;
+    (async () => {
+      await initDB();
+      let restoredUser = null;
+      try {
+        const saved = sessionStorage.getItem('medvis_user');
+        if (saved) restoredUser = JSON.parse(saved);
+      } catch (_) {}
+
+      if (restoredUser?.role === "doctor") {
+        setCloudSyncUser(restoredUser);
+        await cloudPullForUser(restoredUser);
+      } else {
+        setCloudSyncUser(null);
+      }
+
+      await autoImportLocalDatasetV1(1);
+
+      if (restoredUser?.role === "doctor") {
+        await cloudPushNow(true);
+      }
+
+      if (cancelled) return;
       setDbLoaded(true);
-      // Check for saved session
-      const saved = sessionStorage.getItem('medvis_user');
-      if (saved) try { setUser(JSON.parse(saved)); } catch{}
-    });
+      if (restoredUser) setUser(restoredUser);
+    })();
+    return () => { cancelled = true; };
   }, []);
 
-  const handleLogin = (u) => {
+  useEffect(() => {
+    const onUnload = () => {
+      if (user?.role === "doctor") cloudPushNow(true);
+    };
+    window.addEventListener("beforeunload", onUnload);
+    return () => window.removeEventListener("beforeunload", onUnload);
+  }, [user?.role, user?.email, user?.id]);
+
+  const handleLogin = async (u) => {
+    if (u?.role === "doctor") {
+      setCloudSyncUser(u);
+      await cloudPullForUser(u);
+      await cloudPushNow(true);
+    } else {
+      setCloudSyncUser(null);
+    }
     setUser(u);
     sessionStorage.setItem('medvis_user', JSON.stringify(u));
   };
   const handleLogout = () => {
+    if (user?.role === "doctor") {
+      cloudPushNow(true);
+    }
+    setCloudSyncUser(null);
     setUser(null);
     sessionStorage.removeItem('medvis_user');
   };

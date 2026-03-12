@@ -1,6 +1,9 @@
 import json
 import os
 import re
+import sqlite3
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,9 +24,15 @@ INDEX_CANDIDATES = [
 
 API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+CLOUD_DB_PATH = Path(os.getenv("CLOUD_DB_PATH", str(BASE_DIR / "cloud_snapshots.db")))
+try:
+    CLOUD_DB_MAX_BYTES = int(os.getenv("CLOUD_DB_MAX_BYTES", "20000000"))
+except ValueError:
+    CLOUD_DB_MAX_BYTES = 20000000
 
 app = Flask(__name__, static_folder=None)
 _client = genai.Client(api_key=API_KEY) if API_KEY else None
+_cloud_lock = threading.Lock()
 
 ALLOWED_ORGANS = [
     "skull",
@@ -147,6 +156,39 @@ ORGAN_ID_ALIASES = {
 def canonicalize_organ_id(oid: str) -> str:
     key = str(oid or "").strip()
     return ORGAN_ID_ALIASES.get(key, key)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _normalize_doctor_key(raw: str) -> str:
+    key = str(raw or "").strip().lower()
+    if not key:
+        raise ValueError("doctor key is required")
+    if len(key) > 190:
+        key = key[:190]
+    return key
+
+
+def _init_cloud_store() -> None:
+    CLOUD_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(CLOUD_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS doctor_snapshots (
+                doctor_key TEXT PRIMARY KEY,
+                db_b64 TEXT NOT NULL,
+                db_sha256 TEXT DEFAULT '',
+                size_bytes INTEGER DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+_init_cloud_store()
 
 
 _PROMPT_FILE = BASE_DIR / "gemini_prompt_humapper.txt"
@@ -279,6 +321,85 @@ def serve_index():
 def serve_3d(filename: str):
     folder = BASE_DIR / "3d"
     return send_from_directory(folder, filename)
+
+
+@app.get("/api/cloud-db/<path:doctor_key>")
+def cloud_db_get(doctor_key: str):
+    try:
+        key = _normalize_doctor_key(doctor_key)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    with _cloud_lock, sqlite3.connect(CLOUD_DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT doctor_key, db_b64, db_sha256, size_bytes, updated_at FROM doctor_snapshots WHERE doctor_key=?",
+            (key,),
+        ).fetchone()
+
+    if not row:
+        return jsonify({"error": "not_found"}), 404
+
+    return jsonify(
+        {
+            "doctor_key": row[0],
+            "db_b64": row[1],
+            "db_sha256": row[2] or "",
+            "size_bytes": int(row[3] or 0),
+            "updated_at": row[4],
+        }
+    )
+
+
+@app.put("/api/cloud-db/<path:doctor_key>")
+def cloud_db_put(doctor_key: str):
+    try:
+        key = _normalize_doctor_key(doctor_key)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    data = request.get_json(silent=True) or {}
+    db_b64 = str(data.get("db_b64", "")).strip()
+    if not db_b64:
+        return jsonify({"error": "db_b64 is required"}), 400
+
+    approx_size = (len(db_b64) * 3) // 4
+    if approx_size <= 0:
+        return jsonify({"error": "empty payload"}), 400
+    if approx_size > CLOUD_DB_MAX_BYTES:
+        return jsonify({"error": f"payload too large (>{CLOUD_DB_MAX_BYTES} bytes)"}), 413
+
+    db_sha256 = str(data.get("db_sha256", "")).strip().lower()[:128]
+    updated_at = _utc_now_iso()
+
+    with _cloud_lock, sqlite3.connect(CLOUD_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO doctor_snapshots(doctor_key, db_b64, db_sha256, size_bytes, updated_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(doctor_key) DO UPDATE SET
+              db_b64=excluded.db_b64,
+              db_sha256=excluded.db_sha256,
+              size_bytes=excluded.size_bytes,
+              updated_at=excluded.updated_at
+            """,
+            (key, db_b64, db_sha256, approx_size, updated_at),
+        )
+        conn.commit()
+
+    return jsonify(
+        {
+            "ok": True,
+            "doctor_key": key,
+            "db_sha256": db_sha256,
+            "size_bytes": approx_size,
+            "updated_at": updated_at,
+        }
+    )
+
+
+@app.post("/api/cloud-db/<path:doctor_key>")
+def cloud_db_post(doctor_key: str):
+    return cloud_db_put(doctor_key)
 
 
 @app.get("/<path:filename>")
