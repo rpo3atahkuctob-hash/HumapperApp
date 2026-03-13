@@ -56,6 +56,15 @@ Core rules (high priority):
    - Map organ only if anatomically/clinically justified by the same statement.
    - NEVER assign a default organ (especially never default to heart).
    - If organ cannot be mapped reliably, skip that item instead of inventing organ ids.
+   - Dental/oral terms (gingivitis, periodontitis, dental caries, tooth, gum, oral cavity, palate, buccal mucosa, dental care)
+     map to oral_cavity unless the statement explicitly describes TMJ or salivary glands.
+   - Sinusitis / rhinosinusitis / rhinitis / nasal congestion map to nasal_sinuses, not to heart and not to whole skull.
+   - When sinus or nasal disease is stated, prefer the smallest plausible focus (nose + paranasal sinuses) and avoid generic skull highlighting.
+   - TMJ / temporomandibular statements map to tmj, not heart and not generic skull.
+   - Salivary/parotid/submandibular/sublingual statements map to salivary_glands.
+   - Do not map oral/dental disease to skull just because the anatomy is in the head region.
+   - Do not map to heart unless there is explicit cardiac evidence (heart/cardiac/myocardial/coronary/arrhythmia/atrial/ventricular/pericardial terms).
+   - General cranial/head/facial words alone are not enough to infer heart or skull pathology.
 
 6) Non-clinical social/context statements:
    education level, transport access, housing, occupation/service, administrative context, etc.
@@ -69,6 +78,15 @@ Core rules (high priority):
 Language handling:
 - Input can be English or Russian.
 - Keep disease names as they appear in source text when possible.
+- Be robust to bilingual medical UI text where the visible diagnosis may be Russian but the source note may still contain English terms.
+- When English and Russian terms point to the same concept, keep one clinically coherent result only.
+
+Examples:
+- "Gingivitis (disorder)" -> oral_cavity + sick
+- "Patient referral for dental care (procedure)" -> oral_cavity + warning, not heart
+- "Screening for malignant neoplasm of colon (procedure)" -> large_intestine + warning, not sick by default
+- "Chronic congestive heart failure (disorder)" -> heart + sick
+- "Viral sinusitis (disorder)" -> nasal_sinuses + sick, never heart and never whole skull
 
 Medical text:
 <MEDICAL_TEXT>

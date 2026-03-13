@@ -749,7 +749,15 @@ function buildTimelineImageIndexForRows(rows) {
   const byStudy = new Map();
   const byOrgan = new Map();
   (rows || []).forEach(row => {
-    const organ = canonicalizeOrganId(row?.organ_id || "");
+    const payload = parseJsonObjectSafe(row?.payload);
+    const organ = resolveClinicalOrganId(
+      row?.organ_id || payload?.organ_id || "",
+      row?.study_type,
+      row?.conclusion,
+      payload?.conclusion,
+      payload?.condition_description,
+      payload?.notes
+    );
     if (!organ) return;
     const refs = extractTimelineMediaRefs(row);
     if (!refs.length) return;
@@ -768,6 +776,637 @@ function hasTimelineImages(index, organId = "", studyType = "") {
   return !!(byOrgan && byOrgan.get(organ));
 }
 
+const STUDY_TYPE_DISPLAY_RULES = [
+  { re: /^ambulatory$/i, out: "Амбулаторный приём" },
+  { re: /^wellness$/i, out: "Профилактический осмотр" },
+  { re: /^outpatient$/i, out: "Амбулаторное исследование" },
+  { re: /^inpatient$/i, out: "Стационарное исследование" },
+  { re: /^emergency$/i, out: "Неотложная помощь" },
+  { re: /^consultation$/i, out: "Консультация" },
+  { re: /^follow[\s_-]?up$/i, out: "Контрольный визит" },
+  { re: /^manual$/i, out: "Ручная запись" },
+  { re: /^imported$/i, out: "Импортированное исследование" },
+  { re: /^ct$/i, out: "КТ" },
+  { re: /^mri$|^mr$/i, out: "МРТ" },
+  { re: /^xr(?:ay)?$/i, out: "Рентген" },
+  { re: /^ultrasound$|^us$/i, out: "УЗИ" },
+  { re: /^scan$/i, out: "Сканирование" },
+];
+
+const SEMANTIC_TAG_DISPLAY_RU = {
+  disorder: "расстройство",
+  finding: "клиническая находка",
+  procedure: "процедура",
+  situation: "клиническая ситуация",
+  person: "персона",
+  "morphologic abnormality": "морфологическое изменение",
+  "morphological abnormality": "морфологическое изменение",
+};
+
+const CLINICAL_TARGET_TRANSLATIONS = {
+  "breast": { nom: "молочная железа", gen: "молочной железы" },
+  "colon": { nom: "ободочная кишка", gen: "ободочной кишки" },
+  "large intestine": { nom: "толстая кишка", gen: "толстой кишки" },
+  "small intestine": { nom: "тонкая кишка", gen: "тонкой кишки" },
+  "heart": { nom: "сердце", gen: "сердца" },
+  "right lung": { nom: "правое лёгкое", gen: "правого лёгкого" },
+  "left lung": { nom: "левое лёгкое", gen: "левого лёгкого" },
+  "lung": { nom: "лёгкие", gen: "лёгких" },
+  "pancreas": { nom: "поджелудочная железа", gen: "поджелудочной железы" },
+  "liver": { nom: "печень", gen: "печени" },
+  "thyroid gland": { nom: "щитовидная железа", gen: "щитовидной железы" },
+  "prostate": { nom: "предстательная железа", gen: "предстательной железы" },
+  "mouth": { nom: "полость рта", gen: "полости рта" },
+  "oral cavity": { nom: "полость рта", gen: "полости рта" },
+  "gums": { nom: "дёсны", gen: "дёсен" },
+  "dental care": { nom: "стоматологическая помощь", gen: "стоматологической помощи" },
+  "dental": { nom: "стоматологическая область", gen: "стоматологической области" },
+  "jaw": { nom: "челюсть", gen: "челюсти" },
+  "right kidney": { nom: "правая почка", gen: "правой почки" },
+  "left kidney": { nom: "левая почка", gen: "левой почки" },
+  "kidney": { nom: "почка", gen: "почки" },
+  "bladder": { nom: "мочевой пузырь", gen: "мочевого пузыря" },
+  "stomach": { nom: "желудок", gen: "желудка" },
+  "sinus": { nom: "пазуха", gen: "пазухи" },
+  "pharynx": { nom: "глотка", gen: "глотки" },
+};
+
+const DIAGNOSIS_GLOSSARY = [
+  {
+    canonical_key: "gingivitis",
+    source_en: "gingivitis",
+    display_ru: "Гингивит",
+    organ_id: "oral_cavity",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "sick",
+    aliases_en: ["gingivitis", "gingival inflammation", "gingival bleeding", "bleeding gums", "swollen gums"],
+    aliases_ru: ["гингивит", "воспаление дёсен", "воспаление десен", "кровоточивость дёсен", "кровоточивость десен"],
+  },
+  {
+    canonical_key: "periodontitis",
+    source_en: "periodontitis",
+    display_ru: "Пародонтит",
+    organ_id: "oral_cavity",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "sick",
+    aliases_en: ["periodontitis", "periodontal disease", "periodontal infection", "gum abscess"],
+    aliases_ru: ["пародонтит", "болезнь пародонта", "инфекция пародонта"],
+  },
+  {
+    canonical_key: "dental_caries",
+    source_en: "dental caries",
+    display_ru: "Кариес",
+    organ_id: "oral_cavity",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["dental caries", "caries", "tooth decay", "cavity"],
+    aliases_ru: ["кариес", "кариозная полость", "разрушение зуба"],
+  },
+  {
+    canonical_key: "prediabetes",
+    source_en: "prediabetes",
+    display_ru: "Предиабет",
+    organ_id: "pancreas",
+    semantic_class: "finding",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["prediabetes", "pre-diabetes", "impaired glucose tolerance"],
+    aliases_ru: ["предиабет", "нарушенная толерантность к глюкозе"],
+  },
+  {
+    canonical_key: "acute_bronchitis",
+    source_en: "acute bronchitis",
+    display_ru: "Острый бронхит",
+    organ_id: "lung_right",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "sick",
+    aliases_en: ["acute bronchitis", "bronchitis"],
+    aliases_ru: ["острый бронхит", "бронхит"],
+  },
+  {
+    canonical_key: "viral_sinusitis",
+    source_en: "viral sinusitis",
+    display_ru: "Вирусный синусит",
+    organ_id: "nasal_sinuses",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "sick",
+    aliases_en: ["viral sinusitis", "sinusitis", "rhinosinusitis", "acute sinusitis"],
+    aliases_ru: ["вирусный синусит", "синусит", "риносинусит", "острый синусит", "гайморит"],
+  },
+  {
+    canonical_key: "rhinitis",
+    source_en: "rhinitis",
+    display_ru: "Ринит",
+    organ_id: "nasal_sinuses",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["rhinitis", "allergic rhinitis", "nasal congestion"],
+    aliases_ru: ["ринит", "аллергический ринит", "заложенность носа"],
+  },
+  {
+    canonical_key: "acute_viral_pharyngitis",
+    source_en: "acute viral pharyngitis",
+    display_ru: "Острый вирусный фарингит",
+    organ_id: "hyoid_laryngeal",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["acute viral pharyngitis", "viral pharyngitis", "pharyngitis"],
+    aliases_ru: ["острый вирусный фарингит", "вирусный фарингит", "фарингит"],
+  },
+  {
+    canonical_key: "medication_review_due",
+    source_en: "medication review due",
+    display_ru: "Требуется пересмотр медикаментозной терапии",
+    organ_id: "general",
+    semantic_class: "situation",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["medication review due", "medication review", "review due"],
+    aliases_ru: ["требуется пересмотр медикаментозной терапии", "пересмотр медикаментозной терапии"],
+  },
+  {
+    canonical_key: "stress",
+    source_en: "stress",
+    display_ru: "Стресс",
+    organ_id: "general",
+    semantic_class: "finding",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["stress"],
+    aliases_ru: ["стресс"],
+  },
+  {
+    canonical_key: "reports_of_violence_in_environment",
+    source_en: "reports of violence in the environment",
+    display_ru: "Сообщения о насилии в окружении",
+    organ_id: "general",
+    semantic_class: "finding",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["reports of violence in the environment", "violence in the environment"],
+    aliases_ru: ["сообщения о насилии в окружении", "насилие в окружении"],
+  },
+  {
+    canonical_key: "intimate_partner_abuse",
+    source_en: "victim of intimate partner abuse",
+    display_ru: "Насилие со стороны партнёра",
+    organ_id: "general",
+    semantic_class: "finding",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["victim of intimate partner abuse", "intimate partner abuse", "partner abuse", "domestic violence"],
+    aliases_ru: ["насилие со стороны партнёра", "насилие со стороны партнера", "домашнее насилие"],
+  },
+  {
+    canonical_key: "risk_activity_involvement",
+    source_en: "risk activity involvement",
+    display_ru: "Вовлечённость в рискованное поведение",
+    organ_id: "general",
+    semantic_class: "finding",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["risk activity involvement", "risk involvement", "risk taking behavior"],
+    aliases_ru: ["вовлечённость в рискованное поведение", "вовлеченность в рискованное поведение", "рискованное поведение"],
+  },
+  {
+    canonical_key: "higher_education",
+    source_en: "received higher education",
+    display_ru: "Получено высшее образование",
+    organ_id: "general",
+    semantic_class: "finding",
+    ui_style: "clinical",
+    defaultSeverity: "none",
+    aliases_en: ["received higher education", "higher education"],
+    aliases_ru: ["получено высшее образование", "высшее образование"],
+  },
+  {
+    canonical_key: "full_time_employment",
+    source_en: "full-time employment",
+    display_ru: "Полная занятость",
+    organ_id: "general",
+    semantic_class: "finding",
+    ui_style: "clinical",
+    defaultSeverity: "none",
+    aliases_en: ["full-time employment", "full time employment", "employment"],
+    aliases_ru: ["полная занятость", "трудоустройство", "занятость"],
+  },
+  {
+    canonical_key: "severe_anxiety_panic",
+    source_en: "severe anxiety (panic)",
+    display_ru: "Тяжёлое тревожное расстройство с паническими атаками",
+    organ_id: "general",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["severe anxiety", "severe anxiety panic", "panic disorder", "anxiety panic"],
+    aliases_ru: ["тяжёлая тревога", "тяжелая тревога", "паническое расстройство", "панические атаки"],
+  },
+  {
+    canonical_key: "heart_failure",
+    source_en: "chronic congestive heart failure",
+    display_ru: "Хроническая застойная сердечная недостаточность",
+    organ_id: "heart",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "sick",
+    aliases_en: ["chronic congestive heart failure", "congestive heart failure", "heart failure"],
+    aliases_ru: ["хроническая застойная сердечная недостаточность", "застойная сердечная недостаточность", "сердечная недостаточность"],
+  },
+  {
+    canonical_key: "ischemic_heart_disease",
+    source_en: "ischemic heart disease",
+    display_ru: "Ишемическая болезнь сердца",
+    organ_id: "heart",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "sick",
+    aliases_en: ["ischemic heart disease", "ischaemic heart disease", "coronary heart disease"],
+    aliases_ru: ["ишемическая болезнь сердца", "ибс", "коронарная болезнь сердца"],
+  },
+  {
+    canonical_key: "acute_infective_cystitis",
+    source_en: "acute infective cystitis",
+    display_ru: "Острый инфекционный цистит",
+    organ_id: "bladder",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "sick",
+    aliases_en: ["acute infective cystitis", "infective cystitis", "acute cystitis", "cystitis"],
+    aliases_ru: ["острый инфекционный цистит", "инфекционный цистит", "острый цистит", "цистит"],
+  },
+  {
+    canonical_key: "gingival_disease",
+    source_en: "gingival disease",
+    display_ru: "Заболевание дёсен",
+    organ_id: "oral_cavity",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "sick",
+    aliases_en: ["gingival disease", "gum disease"],
+    aliases_ru: ["заболевание дёсен", "болезнь дёсен"],
+  },
+  {
+    canonical_key: "malignant_neoplasm_breast",
+    source_en: "malignant neoplasm of breast",
+    display_ru: "Злокачественное новообразование молочной железы",
+    organ_id: "general",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "sick",
+    aliases_en: ["malignant neoplasm of breast", "breast cancer", "breast carcinoma"],
+    aliases_ru: ["злокачественное новообразование молочной железы", "рак молочной железы", "карцинома молочной железы"],
+  },
+  {
+    canonical_key: "screening_colon_neoplasm",
+    source_en: "screening for malignant neoplasm of colon",
+    display_ru: "Скрининг злокачественного новообразования ободочной кишки",
+    organ_id: "large_intestine",
+    semantic_class: "procedure",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["screening for malignant neoplasm of colon", "colon cancer screening"],
+    aliases_ru: ["скрининг злокачественного новообразования ободочной кишки", "скрининг рака ободочной кишки"],
+  },
+  {
+    canonical_key: "dental_referral",
+    source_en: "patient referral for dental care",
+    display_ru: "Направление на стоматологическую помощь",
+    organ_id: "oral_cavity",
+    semantic_class: "procedure",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["patient referral for dental care", "referral for dental care", "dental referral"],
+    aliases_ru: ["направление на стоматологическую помощь", "направление к стоматологу"],
+  },
+  {
+    canonical_key: "sprain",
+    source_en: "sprain",
+    display_ru: "Растяжение связок",
+    organ_id: "general",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "sick",
+    aliases_en: ["sprain", "ligament sprain"],
+    aliases_ru: ["растяжение", "растяжение связок"],
+  },
+  {
+    canonical_key: "obesity",
+    source_en: "obesity",
+    display_ru: "Ожирение",
+    organ_id: "general",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["obesity", "morbid obesity"],
+    aliases_ru: ["ожирение", "морбидное ожирение"],
+  },
+  {
+    canonical_key: "hyperlipidemia",
+    source_en: "hyperlipidemia",
+    display_ru: "Гиперлипидемия",
+    organ_id: "general",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["hyperlipidemia", "mixed hyperlipidemia", "dyslipidemia"],
+    aliases_ru: ["гиперлипидемия", "смешанная гиперлипидемия", "дислипидемия"],
+  },
+  {
+    canonical_key: "hypertension",
+    source_en: "hypertension",
+    display_ru: "Артериальная гипертензия",
+    organ_id: "heart",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["hypertension", "essential hypertension", "high blood pressure"],
+    aliases_ru: ["артериальная гипертензия", "гипертония", "повышенное артериальное давление"],
+  },
+  {
+    canonical_key: "diabetes_mellitus",
+    source_en: "diabetes mellitus",
+    display_ru: "Сахарный диабет",
+    organ_id: "pancreas",
+    semantic_class: "diagnosis",
+    ui_style: "clinical",
+    defaultSeverity: "warning",
+    aliases_en: ["diabetes mellitus", "type 2 diabetes mellitus", "type 1 diabetes mellitus"],
+    aliases_ru: ["сахарный диабет", "сахарный диабет 2 типа", "сахарный диабет 1 типа"],
+  },
+];
+
+function normalizeMedicalSearchText(raw) {
+  return String(raw || "")
+    .toLowerCase()
+    .replace(/[_/]/g, " ")
+    .replace(/[.,;:()[\]{}"'`]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractSemanticTag(raw) {
+  const m = String(raw || "").trim().match(/\(([^)]+)\)\s*$/i);
+  return m ? normalizeMedicalSearchText(m[1]) : "";
+}
+
+function stripSemanticTag(raw) {
+  return String(raw || "").replace(/\s*\(([^)]+)\)\s*$/i, "").trim();
+}
+
+function capitalizeMedicalDisplay(text) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  return s ? s[0].toUpperCase() + s.slice(1) : "";
+}
+
+function dedupeAdjacentWords(text) {
+  const tokens = String(text || "").split(/\s+/).filter(Boolean);
+  const out = [];
+  tokens.forEach(tok => {
+    const prev = out[out.length - 1];
+    if (prev && prev.toLowerCase() === tok.toLowerCase()) return;
+    out.push(tok);
+  });
+  return out.join(" ");
+}
+
+function translateStudyTypeDisplay(raw) {
+  const src = String(raw || "").trim();
+  if (!src) return "";
+  const norm = normalizeMedicalSearchText(src);
+  const rule = STUDY_TYPE_DISPLAY_RULES.find(item => item.re.test(norm));
+  if (rule) return rule.out;
+  return src;
+}
+
+function translateClinicalTargetPhrase(raw, grammaticalCase = "gen") {
+  const src = normalizeMedicalSearchText(raw);
+  if (!src) return "";
+  const entries = Object.entries(CLINICAL_TARGET_TRANSLATIONS).sort((a, b) => b[0].length - a[0].length);
+  const exact = entries.find(([key]) => key === src);
+  if (exact) {
+    const forms = exact[1];
+    return forms[grammaticalCase] || forms.nom || src;
+  }
+  const partial = entries.find(([key]) => src.includes(key));
+  if (partial) {
+    const [key, forms] = partial;
+    const replacement = forms[grammaticalCase] || forms.nom || key;
+    return src.replace(key, replacement);
+  }
+  return raw;
+}
+
+function getDiagnosisGlossaryMatches(raw) {
+  const norm = normalizeMedicalSearchText(raw);
+  if (!norm) return [];
+  return DIAGNOSIS_GLOSSARY
+    .map(entry => {
+      const aliases = [...(entry.aliases_en || []), ...(entry.aliases_ru || []), entry.source_en, entry.display_ru]
+        .map(normalizeMedicalSearchText)
+        .filter(Boolean);
+      const matchedAlias = aliases
+        .sort((a, b) => b.length - a.length)
+        .find(alias => {
+          const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+          return new RegExp(`(?:^|\\s)${escaped}(?:$|\\s)`, "i").test(norm);
+        });
+      return matchedAlias ? { entry, matchedAlias } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.matchedAlias.length - a.matchedAlias.length);
+}
+
+const CLINICAL_DISPLAY_RULES = [
+  {
+    re: /^screening for malignant neoplasm of (.+)$/i,
+    out: (_, target) => `Скрининг злокачественного новообразования ${translateClinicalTargetPhrase(target, "gen")}`,
+  },
+  {
+    re: /^malignant neoplasm of (.+)$/i,
+    out: (_, target) => `Злокачественное новообразование ${translateClinicalTargetPhrase(target, "gen")}`,
+  },
+  {
+    re: /^screening for (.+)$/i,
+    out: (_, target) => `Скрининг ${translateClinicalTargetPhrase(target, "gen")}`,
+  },
+  {
+    re: /^history of (.+)$/i,
+    out: (_, target) => `Анамнез: ${capitalizeMedicalDisplay(translateClinicalTextDisplay(target))}`,
+  },
+  {
+    re: /^suspected (.+)$/i,
+    out: (_, target) => `Подозрение на ${String(translateClinicalTextDisplay(target) || target).toLowerCase()}`,
+  },
+];
+
+const CLINICAL_FALLBACK_PHRASES = {
+  "heart failure": "сердечная недостаточность",
+  "ischemic heart disease": "ишемическая болезнь сердца",
+  "acute infective cystitis": "острый инфекционный цистит",
+  "gingival disease": "заболевание дёсен",
+  "viral sinusitis": "вирусный синусит",
+  "panic disorder": "паническое расстройство",
+  "dental care": "стоматологическая помощь",
+  "medication review": "пересмотр медикаментозной терапии",
+  "malignant neoplasm": "злокачественное новообразование",
+};
+
+const CLINICAL_FALLBACK_TOKENS = {
+  acute: "острый",
+  chronic: "хронический",
+  severe: "тяжёлый",
+  viral: "вирусный",
+  infective: "инфекционный",
+  ischemic: "ишемический",
+  malignant: "злокачественный",
+  neoplasm: "новообразование",
+  bronchitis: "бронхит",
+  sinusitis: "синусит",
+  rhinitis: "ринит",
+  cystitis: "цистит",
+  gingival: "десневой",
+  pharyngitis: "фарингит",
+  anxiety: "тревожное расстройство",
+  panic: "панические атаки",
+  stress: "стресс",
+  prediabetes: "предиабет",
+  screening: "скрининг",
+  referral: "направление",
+  dental: "стоматологический",
+  review: "пересмотр",
+  medication: "медикаментозный",
+  care: "помощь",
+  breast: "молочная железа",
+  colon: "ободочная кишка",
+  obesity: "ожирение",
+  hyperlipidemia: "гиперлипидемия",
+  hypertension: "гипертензия",
+  diabetes: "диабет",
+  mellitus: "сахарный",
+  sprain: "растяжение",
+};
+
+function translateClinicalFallbackTokens(raw) {
+  const src = normalizeMedicalSearchText(raw);
+  if (!src) return "";
+  let value = src;
+  Object.entries(CLINICAL_FALLBACK_PHRASES)
+    .sort((a, b) => b[0].length - a[0].length)
+    .forEach(([needle, out]) => {
+      value = value.replace(new RegExp(`\\b${needle.replace(/\s+/g, "\\s+")}\\b`, "g"), out);
+    });
+  const tokens = value.split(/\s+/).filter(Boolean);
+  const translated = tokens.map(tok => CLINICAL_FALLBACK_TOKENS[tok] || tok);
+  const hasUnknownLatin = translated.some(tok => /^[a-z][a-z-]*$/i.test(tok) && !Object.values(CLINICAL_FALLBACK_TOKENS).includes(tok));
+  if (hasUnknownLatin) return capitalizeMedicalDisplay(stripSemanticTag(raw));
+  return capitalizeMedicalDisplay(dedupeAdjacentWords(translated.join(" ")));
+}
+
+function translateClinicalTextDisplay(raw, context = {}) {
+  const src = String(raw || "").replace(/\s+/g, " ").trim();
+  if (!src) return "";
+  const firstLine = src.split(/\r?\n/).map(x => x.trim()).find(Boolean) || src;
+  const tag = extractSemanticTag(firstLine);
+  const stripped = stripSemanticTag(firstLine);
+  if (!stripped) return "";
+  if (/[А-Яа-яЁё]/.test(stripped) && !/[A-Za-z]/.test(stripped)) {
+    return capitalizeMedicalDisplay(stripped);
+  }
+
+  const glossaryMatch = getDiagnosisGlossaryMatches(firstLine)[0];
+  if (glossaryMatch?.entry?.display_ru) {
+    return glossaryMatch.entry.display_ru;
+  }
+
+  for (const rule of CLINICAL_DISPLAY_RULES) {
+    const m = stripped.match(rule.re);
+    if (m) {
+      const result = typeof rule.out === "function" ? rule.out(...m) : rule.out;
+      return capitalizeMedicalDisplay(result);
+    }
+  }
+
+  const fallback = translateClinicalFallbackTokens(stripped);
+  if (fallback) return fallback;
+  if (tag && SEMANTIC_TAG_DISPLAY_RU[tag]) return capitalizeMedicalDisplay(stripped);
+  return capitalizeMedicalDisplay(stripped);
+}
+
+function normalizeMedicalConcepts(raw, context = {}) {
+  const src = String(raw || "").trim();
+  if (!src) return [];
+  const matches = getDiagnosisGlossaryMatches(src).map(({ entry }) => ({
+    ...entry,
+    semantic_tag: extractSemanticTag(src),
+  }));
+  if (context.kind === "study_type") {
+    const display = translateStudyTypeDisplay(src);
+    if (display && display !== src) {
+      matches.push({
+        canonical_key: normalizeMedicalSearchText(src),
+        display_ru: display,
+        semantic_class: "procedure",
+        organ_id: "",
+      });
+    }
+  }
+  const unique = [];
+  const seen = new Set();
+  matches.forEach(item => {
+    if (!item?.canonical_key || seen.has(item.canonical_key)) return;
+    seen.add(item.canonical_key);
+    unique.push(item);
+  });
+  return unique;
+}
+
+function resolveOrganFromConcepts(concepts = []) {
+  const priority = {
+    oral_cavity: 100,
+    tmj: 95,
+    nasal_sinuses: 94,
+    salivary_glands: 92,
+    tonsils: 90,
+    tongue: 89,
+    heart: 88,
+    lung_right: 84,
+    lung_left: 84,
+    pancreas: 82,
+    liver: 82,
+    kidney_right: 80,
+    kidney_left: 80,
+    large_intestine: 78,
+    small_intestine: 77,
+    stomach: 76,
+    bladder: 75,
+    prostate: 74,
+    uterus: 74,
+    ovary_left: 74,
+    thyroid: 73,
+    general: 10,
+  };
+  return (concepts || [])
+    .filter(item => item?.organ_id)
+    .sort((a, b) => (priority[b.organ_id] || 0) - (priority[a.organ_id] || 0))[0]?.organ_id || "";
+}
+
+function translateMedicalDisplay(raw, context = {}) {
+  const kind = context?.kind || "";
+  if (kind === "study_type") return translateStudyTypeDisplay(raw);
+  if (kind === "mesh") return translateMeshLabel(raw);
+  if (kind === "diagnosis" || kind === "finding" || kind === "conclusion" || kind === "note" || !kind) {
+    return translateClinicalTextDisplay(raw, context);
+  }
+  return String(raw || "").trim();
+}
+
 function normalizeDiseaseTitle(raw) {
   let t = String(raw || "").replace(/\s+/g, " ").trim();
   if (!t) return "";
@@ -775,10 +1414,7 @@ function normalizeDiseaseTitle(raw) {
   if (nl.length) t = nl[0];
   const firstSentence = t.split(/[.;]/).map(x => x.trim()).find(Boolean);
   if (firstSentence) t = firstSentence;
-  t = t.replace(/\((?:disorder|finding|procedure)\)/ig, "").trim();
-  t = t.replace(/^screening for\s+/i, "").trim();
-  t = t.replace(/^suspected\s+/i, "").trim();
-  t = t.replace(/^history of\s+/i, "").trim();
+  t = translateMedicalDisplay(t, { kind: "diagnosis" }) || t;
   t = t.replace(/\s{2,}/g, " ").trim();
   if (t.length > 72) t = `${t.slice(0, 69)}…`;
   return t;
@@ -1207,6 +1843,9 @@ const C = {
    ORGAN METADATA
 ═══════════════════════════════════════════════ */
 const OM = {
+  general:                 { n:"Общее исследование",                   e:"", g:"general" },
+  oral_cavity:             { n:"Полость рта и дёсны",                  e:"", g:"gastro" },
+  nasal_sinuses:           { n:"Нос и околоносовые пазухи",            e:"", g:"bone" },
   skull:                   { n:"Череп и лицевой отдел",                e:"", g:"bone" },
   tmj:                     { n:"Височно-нижнечелюстной сустав",        e:"", g:"bone" },
   hyoid_laryngeal:         { n:"Подъязычная кость и гортань",          e:"", g:"bone" },
@@ -1328,6 +1967,24 @@ const ORGAN_ID_ALIASES = {
   "почки":                 "kidney",
   "поджелудочная":         "pancreas",
   "поджелудочная_железа":  "pancreas",
+  sinus:                   "nasal_sinuses",
+  sinuses:                 "nasal_sinuses",
+  nasal_sinuses:           "nasal_sinuses",
+  paranasal_sinus:         "nasal_sinuses",
+  paranasal_sinuses:       "nasal_sinuses",
+  oral:                    "oral_cavity",
+  mouth:                   "oral_cavity",
+  dental:                  "oral_cavity",
+  dentistry:               "oral_cavity",
+  tooth:                   "oral_cavity",
+  teeth:                   "oral_cavity",
+  gingiva:                 "oral_cavity",
+  gums:                    "oral_cavity",
+  periodontal:             "oral_cavity",
+  general_study:           "general",
+  unspecified:             "general",
+  unknown:                 "general",
+  systemic:                "general",
   // joints / bones — mirror server aliases
   temporomandibular_joint: "tmj",
   jaw_joint:               "tmj",
@@ -1367,6 +2024,93 @@ function canonicalizeOrganId(id) {
   return ORGAN_ID_ALIASES[key] || key;
 }
 
+const CLINICAL_TEXT_ORGAN_HINTS = [
+  { organ: "wrist_joint", re: /sprain of wrist|wrist sprain|radiocarpal sprain|wrist injury|лучезапяст|запясть/ },
+  { organ: "ankle_joint", re: /sprain of ankle|ankle sprain|ankle injury|голеностоп|лодыжк/ },
+  { organ: "knee_joint", re: /sprain of knee|knee sprain|knee injury|коленн/ },
+  { organ: "shoulder_joint", re: /sprain of shoulder|shoulder sprain|shoulder injury|плечев.*сустав/ },
+  { organ: "elbow_joint", re: /sprain of elbow|elbow sprain|elbow injury|локтев.*сустав/ },
+  { organ: "oral_cavity", re: /gingiv|gum disease|gums\b|periodont|dental|dentist|dentition|tooth|teeth|incisor|canine|premolar|molar|caries|cavity of tooth|endodont|orthodont|stomat|oral surgery|oral cavity|\bmouth\b|alveolar|buccal mucosa|palate|hard palate|soft palate|oral lesion|гингив|дес[её]н|д[её]сен|стоматолог|зуб|зубы|кариес|полость рта|нёб|альвеол|щёчн.*слизист/ },
+  { organ: "nasal_sinuses", re: /sinusit|rhinitis|rhinosinus|paranasal|nasal congestion|гайморит|фронтит|этмоидит|сфеноидит|ринит|риносинусит|синусит|околоносов|заложенность носа/ },
+  { organ: "tmj", re: /temporomandibular|tmj|jaw joint|mandibular joint|внчс|височно-нижнечелюст/ },
+  { organ: "salivary_glands", re: /parotid|submandibular|sublingual|salivary|xerostomia|sialaden|слюнн|ксеростом/ },
+  { organ: "tonsils", re: /tonsill|tonsil|adenoid|миндалин|аденоид/ },
+  { organ: "hyoid_laryngeal", re: /pharyngit|laryngit|sore throat|throat infection|фарингит|ларингит|горл/ },
+  { organ: "tongue", re: /\btongue\b|glossitis|glossal|uvula|язык|глоссит|язычок/ },
+  { organ: "skull", re: /facial fracture|maxillofacial trauma|mandibular fracture|fracture of jaw|jaw fracture|fracture of maxilla|fracture of mandible|facial skeleton|череп|лицев(ой|ого)|перелом челюсти|перелом лицевого скелета/ },
+  { organ: "heart", re: /\bheart\b|cardiac|myocard|coronary|arrhythm|angina|atrial|ventricular|pericard|endocard|epicard|mitral|tricuspid|aortic valve|сердц|миокард|коронар|аритм|стенокард|предсерд|желудочк|перикард|эндокард|эпикард|митральн|трикуспид|аортальн/ },
+  { organ: "lung_left", re: /left lung|left lower lobe|left upper lobe|left bronch|лев.*л[её]гк|лев.*бронх/ },
+  { organ: "lung_right", re: /right lung|right lower lobe|right upper lobe|right bronch|прав.*л[её]гк|прав.*бронх/ },
+  { organ: "lung_right", re: /\blung\b|pulmonary|pneumonia|asthma|copd|bronch|л[её]гк|пневмон|астм|бронх|хобл/ },
+  { organ: "liver", re: /\bliver\b|hepatic|hepatitis|cirrhosis|steatosis|печен|гепатит|цирроз|стеатоз/ },
+  { organ: "kidney_left", re: /left kidney|лев.*почек|лев.*почк/ },
+  { organ: "kidney_right", re: /right kidney|прав.*почек|прав.*почк/ },
+  { organ: "kidney_right", re: /\bkidney\b|renal|nephro|почек|почк|ренал|нефр/ },
+  { organ: "brain", re: /\bbrain\b|cerebr|stroke|intracran|epilep|migraine|neuro|мозг|инсульт|внутричереп|эпилеп|мигрен|нейро/ },
+  { organ: "thyroid", re: /\bthyroid\b|hypothy|hyperthy|щитовид|гипотире|гипертире/ },
+  { organ: "pancreas", re: /pancrea|diabet|insulin|поджелуд|диабет|инсулин/ },
+  { organ: "stomach", re: /\bstomach\b|gastr|ulcer|duoden|желуд|гастр|язв|дуоден/ },
+  { organ: "small_intestine", re: /small intestine|ileum|jejunum|тонк.*киш|подвздошн|тощ.*киш/ },
+  { organ: "large_intestine", re: /\bcolon\b|large intestine|colitis|divertic|ободочн.*киш|толст.*киш|колит|дивертик/ },
+  { organ: "bladder", re: /\bbladder\b|cystitis|urinary tract|urinary\b|мочев.*пузыр|цистит|мочевыводящ/ },
+  { organ: "prostate", re: /\bprostate\b|prostatic|проста|предстательн/ },
+  { organ: "uterus", re: /\buterus\b|endometri|pregnan|cervix|матк|эндометри|беремен|шейк.*матк/ },
+  { organ: "ovary_left", re: /\bovary\b|ovarian|яичник|овариал/ },
+  { organ: "spine", re: /\bspine\b|vertebra|lumbar|thoracic|cervical pain|позвоноч|позвон|пояснич|грудн.*отдел|шейн.*боль/ },
+];
+
+const GENERAL_CLINICAL_CONTEXT_RE = /reports? of violence|violence in the environment|intimate partner abuse|domestic violence|risk activity involvement|risk taking behavior|received higher education|higher education|full[- ]time employment|\bemployment\b|medication review due|review due|wellness visit|wellness|checkup|preventive visit|preventive care|annual exam|social determinant|housing insecurity|financial insecurity|food insecurity|transportation insecurity|насилие|социальн|занятост|образован/;
+
+function resolveClinicalOrganId(rawOrganId = "", ...texts) {
+  const base = canonicalizeOrganId(rawOrganId || "");
+  const combined = texts
+    .flat()
+    .map(x => String(x || "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (combined) {
+    const normalizedConcepts = normalizeMedicalConcepts(combined, { kind: "diagnosis", organId: base });
+    const conceptOrgan = resolveOrganFromConcepts(normalizedConcepts);
+    if (conceptOrgan && conceptOrgan !== "general") {
+      return conceptOrgan;
+    }
+
+    for (const hint of CLINICAL_TEXT_ORGAN_HINTS) {
+      if (hint.re.test(combined)) return hint.organ;
+    }
+
+    if (
+      conceptOrgan === "general" &&
+      normalizedConcepts.some(item => item?.organ_id === "general") &&
+      (!base || base === "general" || base === "heart" || base === "skull" || base === "oral_cavity" || base === "nasal_sinuses")
+    ) {
+      return "general";
+    }
+
+    if (
+      GENERAL_CLINICAL_CONTEXT_RE.test(combined) &&
+      (!base || base === "general" || base === "heart" || base === "skull" || base === "oral_cavity" || base === "nasal_sinuses")
+    ) {
+      return "general";
+    }
+
+    if (
+      base === "heart" &&
+      !/\bheart\b|cardiac|myocard|coronary|arrhythm|angina|atrial|ventricular|pericard|endocard|epicard|mitral|tricuspid|aortic valve/.test(combined) &&
+      (/\(procedure\)|\(situation\)|\bprocedure\b|\bsituation\b|referral|screening|review due|wellness|checkup|examination|consultation|follow[- ]up/.test(combined))
+    ) {
+      return "general";
+    }
+  }
+
+  if (base && (OM[base] || ORGAN_ID_EXPANSIONS[base])) return base;
+  return combined ? "general" : (base || "");
+}
+
 function normalizeMeshName(raw) {
   let s = String(raw || "").trim();
   if (!s) return "";
@@ -1396,6 +2140,8 @@ function normalizeMeshName(raw) {
 const HEAD_PRIORITY_BLOCK_ORGANS = new Set([
   "brain",
   "skull",
+  "nasal_sinuses",
+  "oral_cavity",
   "meninges",
   "tmj",
   "head_neck_muscles",
@@ -1417,6 +2163,16 @@ function isHeadRegionMesh(meshName, cat = "", organId = "") {
   if (/\b(head|cranial|cranium|skull|brain|cerebr|cerebell|orbital|orbit|ocular|ophthalm|eye|nasal|sinus|ethmoid|frontal|parietal|temporal|occipital|maxilla|mandible|jaw|zygoma|hyoid|olfactory|facial|auricular|ear|tonsil|tongue)\b/.test(n)) return true;
   if (cat === "nervous" && /\b(ventricle|gyrus|sulcus|insula|thalam|hippoc|amygdal|pons|medulla)\b/.test(n)) return true;
   return false;
+}
+
+function suppressNonHeadClinicalEntryForHeadMesh(meshName, cat, entry) {
+  if (!entry) return null;
+  const entryOrganId = canonicalizeOrganId(entry.organ_id || "");
+  const meshIsHeadRegion = isHeadRegionMesh(meshName, cat, "");
+  if (meshIsHeadRegion && entryOrganId && !HEAD_PRIORITY_BLOCK_ORGANS.has(entryOrganId)) {
+    return null;
+  }
+  return entry;
 }
 
 function prettyMeshLabel(raw) {
@@ -1479,6 +2235,9 @@ const MESH_WORD_RU = {
   eyeball: "глазное яблоко", tooth: "зуб", duct: "проток", sinus: "синус",
   first: "первый", second: "второй", third: "третий", fourth: "четвёртый", fifth: "пятый",
   sixth: "шестой", seventh: "седьмой", eighth: "восьмой", ninth: "девятый", tenth: "десятый",
+  gyrus: "извилина", gyri: "извилины", sulci: "борозды", oculi: "глаза",
+  olfactory: "обонятельный", palpebral: "вековая", orbitofrontal: "орбитофронтальный",
+  shaped: "", shape: "", orbitalis: "глазничная", facies: "поверхность",
 };
 
 Object.assign(MESH_WORD_RU, {
@@ -1544,7 +2303,9 @@ Object.assign(MESH_WORD_RU, {
   talofibular: "таранно-малоберцовый", great: "большой",
   vestibulocochlear: "преддверно-улитковый", glossopharyngeal: "языкоглоточный", hypoglossal: "подъязычный",
   abducens: "отводящий", apicoposterior: "верхушечно-задний", orbitofrontal: "орбитофронтальный",
-  pericallosal: "перикаллёзный", insular: "островковый"
+  pericallosal: "перикаллёзный", insular: "островковый", shape: "", shaped: "",
+  oculi: "глаза", orbital: "глазничный", orbit: "глазница", orbitalis: "глазничная",
+  gyrus: "извилина", sulci: "борозды", sulcus: "борозда", gyri: "извилины", optic: "зрительный"
 });
 
 const RU_NOUN_GENDER = {
@@ -1654,6 +2415,12 @@ function transliterateEnToken(token) {
 const MESH_PHRASE_RULES = [
   { re: /\brectus abdominis muscle\b/gi, out: "прямая мышца живота" },
   { re: /\blatissimus dorsi muscle\b/gi, out: "широчайшая мышца спины" },
+  { re: /\blateral ventricle\b/gi, out: "латеральный желудочек" },
+  { re: /\bolfactory sulcus\b/gi, out: "обонятельная борозда" },
+  { re: /\borbital sulci?\b/gi, out: "глазничные борозды" },
+  { re: /\borbital gyri?\b/gi, out: "глазничные извилины" },
+  { re: /\bpalpebral part of orbicularis oculi\b/gi, out: "вековая часть круговой мышцы глаза" },
+  { re: /\borbicularis oculi\b/gi, out: "круговая мышца глаза" },
   { re: /\b(internal|external)\s+intercostal\s+muscles?\b/gi, out: (_, t) => `${t === "internal" ? "внутренние" : "наружные"} межрёберные мышцы` },
   { re: /\b(internal|external)\s+intercostal\s+membrane\b/gi, out: (_, t) => `${t === "internal" ? "внутренняя" : "наружная"} межрёберная мембрана` },
   { re: /\bdiaphragmatic fascia\b/gi, out: "диафрагмальная фасция" },
@@ -1713,6 +2480,26 @@ const MESH_CASE_FIX_RULES = [
   { re: /сегмент\s+печень/gi, out: "сегмент печени" },
 ];
 
+function dedupeRepeatedMedicalPhrases(text) {
+  let out = String(text || "").trim();
+  if (!out) return "";
+  out = out
+    .replace(/\bshape(?:d)?\b/gi, " ")
+    .replace(/\bmesh\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  let prev = "";
+  while (out !== prev) {
+    prev = out;
+    out = out
+      .replace(/\b([А-Яа-яЁёA-Za-z-]+(?:\s+[А-Яа-яЁёA-Za-z-]+){1,3})\s+\1\b/gi, "$1")
+      .replace(/\b([А-Яа-яЁёA-Za-z-]+)\s+\1\b/gi, "$1")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  return out;
+}
+
 function translateMeshLabel(raw) {
   const { core, numberTokens } = splitMeshCoreAndNumbers(raw);
   let base = String(core || "")
@@ -1729,6 +2516,7 @@ function translateMeshLabel(raw) {
     .trim();
   if (!base) return "Орган";
 
+  const exactMatched = MESH_PHRASE_RULES.some(rule => new RegExp(rule.re.source, rule.re.flags).test(base));
   MESH_PHRASE_RULES.forEach(rule => {
     base = base.replace(rule.re, rule.out);
   });
@@ -1741,19 +2529,31 @@ function translateMeshLabel(raw) {
     .filter(p => !["of", "the", "and", "for", "to", "in", "a", "an", "r", "l", "s", "t"].includes(p))
     .filter(p => !/^[0-9]+$/.test(p))
     .filter(p => p.length > 1);
+  let hasUnknownEnglish = false;
   const translated = parts
-    .map(p => MESH_WORD_RU[p] || (/^[a-z]+$/.test(p) ? transliterateEnToken(p) : p))
+    .map(p => {
+      if (MESH_WORD_RU[p] !== undefined) return MESH_WORD_RU[p];
+      if (/^[a-z]+$/.test(p)) {
+        hasUnknownEnglish = true;
+        return p;
+      }
+      return p;
+    })
     .filter(Boolean);
   let text = translated
     .join(" ")
     .replace(/\b([ivx]{1,5})\b/gi, (_, r) => r.toUpperCase())
     .replace(/\s+/g, " ")
     .trim();
+  if (hasUnknownEnglish && !exactMatched) {
+    return appendNumberTokens(prettyMeshLabel(raw), numberTokens);
+  }
   text = applyRuGenderAgreement(text);
   let fixed = text;
   MESH_CASE_FIX_RULES.forEach(rule => {
     fixed = fixed.replace(rule.re, rule.out);
   });
+  fixed = dedupeRepeatedMedicalPhrases(fixed);
   fixed = appendNumberTokens(fixed, numberTokens);
   fixed = fixed.replace(/\s+/g, " ").trim();
   return fixed ? fixed[0].toUpperCase() + fixed.slice(1) : "Орган";
@@ -1779,7 +2579,7 @@ function canonicalizeOrganMap(map) {
 /* ═══ Слои модели: каждый .glb-файл из папки 3d — отдельный слой ═══ */
 const TARGET_GROUPS = [
   { name: "outerlayer",     path: "3d/Outerlayer.glb",     ru: "Наружный слой",                 icon: "", defaultOn: true,  category: "skin" },
-  { name: "muscular",       path: "3d/Muscular.glb",       ru: "Мышечная система",              icon: "", defaultOn: true,  category: "muscular" },
+  { name: "muscular",       path: "3d/Muscular.glb",       ru: "Мышечная система",              icon: "", defaultOn: false, category: "muscular" },
   { name: "skeletal",       path: "3d/Skeletal.glb",       ru: "Костная система",               icon: "", defaultOn: true,  category: "skeletal" },
   { name: "joints",         path: "3d/Joints.glb",         ru: "Суставы",                       icon: "", defaultOn: true,  category: "joints" },
   { name: "cardiovascular", path: "3d/Cardiovascular.glb", ru: "Сердечно-сосудистая система",   icon: "", defaultOn: true,  category: "cardiovascular" },
@@ -1787,6 +2587,12 @@ const TARGET_GROUPS = [
   { name: "nervous",        path: "3d/Nervous.glb",        ru: "Нервная система",               icon: "", defaultOn: true,  category: "nervous" },
   { name: "visceral",       path: "3d/Visceral.glb",       ru: "Внутренние органы",             icon: "", defaultOn: true,  category: "visceral" },
 ];
+
+function buildDefaultGroupVisibility() {
+  const vis = {};
+  TARGET_GROUPS.forEach(g => { vis[g.name] = g.defaultOn !== false; });
+  return vis;
+}
 
 const ORGAN_GROUP_FOCUS_MAP = {
   cardio: ["cardiovascular"],
@@ -1803,31 +2609,7 @@ const ORGAN_GROUP_FOCUS_MAP = {
 };
 
 function buildAutoGroupVisibilityForRows(rows) {
-  const vis = {};
-  TARGET_GROUPS.forEach(g => { vis[g.name] = false; });
-  // External layer must always be visible for any patient.
-  vis.outerlayer = true;
-  const mark = (name) => {
-    if (Object.prototype.hasOwnProperty.call(vis, name)) vis[name] = true;
-  };
-
-  (rows || []).forEach(row => {
-    const st = String(row?.status || "none");
-    if (st !== "sick" && st !== "warning") return;
-    const oid = canonicalizeOrganId(row?.organ_id || row?.organid || "");
-    const organGroup = OM[oid]?.g;
-    (ORGAN_GROUP_FOCUS_MAP[organGroup] || []).forEach(mark);
-
-    // Fallbacks for less precise organ ids.
-    if (/heart|aorta|coronary|carotid|cerebral|vessels/.test(oid)) mark("cardiovascular");
-    if (/^lung_|^trachea$|pulmonary/.test(oid)) {
-      mark("visceral");
-      mark("cardiovascular");
-    }
-    if (/lymph|tonsils|thymus/.test(oid)) mark("lymphoid");
-  });
-
-  return vis;
+  return buildDefaultGroupVisibility();
 }
 
 function normalizeGroupVisibility(raw, fallback = false) {
@@ -1950,6 +2732,47 @@ const DISEASE_DB = [
   { name:"Лёгочная гипертензия", severity:"sick",
     keywords:["лёгочная гипертензия","давление в лёгочной артерии повышено","сдла повышено","ддла","правожелудочковая недостаточность","cor pulmonale","лёгочное сердце","гипертрофия правого желудочка"],
     organs:[{id:"lung_right",status:"sick"},{id:"lung_left",status:"sick"},{id:"heart",status:"warning"}] },
+
+  // ── DENTAL / ORAL ──────────────────────────────
+  { name:"Гингивит", severity:"sick",
+    keywords:["гингивит","gingivitis","воспаление дёсен","воспаление десен","bleeding gums","gum bleeding","swollen gums","gingival inflammation","gingival bleeding","gingiva inflamed"],
+    organs:[{id:"oral_cavity",status:"sick"}] },
+  { name:"Пародонтит", severity:"sick",
+    keywords:["пародонтит","periodontitis","periodontal disease","periodontal infection","болезнь пародонта","карман десны","карманы десны","рецессия десны","шаткость зубов","mobile tooth","tooth mobility"],
+    organs:[{id:"oral_cavity",status:"sick"}] },
+  { name:"Кариес", severity:"warning",
+    keywords:["кариес","dental caries","caries","cavity","tooth decay","разрушение зуба","кариозная полость"],
+    organs:[{id:"oral_cavity",status:"warning"}] },
+  { name:"Пульпит / апикальный периодонтит", severity:"sick",
+    keywords:["пульпит","pulpitis","apical periodontitis","перiapical abscess","periapical abscess","tooth infection","инфекция зуба","корневой канал воспаление","root canal infection"],
+    organs:[{id:"oral_cavity",status:"sick"}] },
+  { name:"Одонтогенный абсцесс", severity:"sick",
+    keywords:["одонтогенный абсцесс","dental abscess","abscess of tooth","periodontal abscess","gum abscess","флюс","периостит челюсти"],
+    organs:[{id:"oral_cavity",status:"sick"}] },
+  { name:"Стоматит / мукозит", severity:"warning",
+    keywords:["стоматит","stomatitis","oral mucositis","aphthous ulcer","афта","афтозный стоматит","ulcer of mouth","язва слизистой рта","oral ulcer"],
+    organs:[{id:"oral_cavity",status:"warning"}] },
+  { name:"Дисфункция ВНЧС", severity:"warning",
+    keywords:["внчс","tmj disorder","temporomandibular disorder","temporomandibular joint disorder","jaw pain","щелчки челюсти","ограничение открывания рта","mandibular pain"],
+    organs:[{id:"tmj",status:"warning"}] },
+  { name:"Сиалоаденит", severity:"warning",
+    keywords:["сиалоаденит","sialadenitis","salivary gland infection","воспаление слюнной железы","parotitis","паротит","submandibular gland inflammation"],
+    organs:[{id:"salivary_glands",status:"warning"}] },
+  { name:"Синусит", severity:"warning",
+    keywords:["sinusitis","rhinosinusitis","viral sinusitis","acute sinusitis","синусит","риносинусит","гайморит","фронтит","этмоидит","сфеноидит"],
+    organs:[{id:"nasal_sinuses",status:"sick"}] },
+  { name:"Ринит", severity:"warning",
+    keywords:["rhinitis","allergic rhinitis","nasal congestion","ринит","аллергический ринит","заложенность носа"],
+    organs:[{id:"nasal_sinuses",status:"warning"}] },
+  { name:"Цистит", severity:"sick",
+    keywords:["acute infective cystitis","infective cystitis","acute cystitis","cystitis","острый инфекционный цистит","инфекционный цистит","острый цистит","цистит"],
+    organs:[{id:"bladder",status:"sick"}] },
+  { name:"Ишемическая болезнь сердца", severity:"sick",
+    keywords:["ischemic heart disease","ischaemic heart disease","coronary heart disease","ишемическая болезнь сердца","ибс"],
+    organs:[{id:"heart",status:"sick"}] },
+  { name:"Заболевание дёсен", severity:"sick",
+    keywords:["gingival disease","gum disease","заболевание дёсен","болезнь дёсен"],
+    organs:[{id:"oral_cavity",status:"sick"}] },
 
   // ── HEPATIC / GI ─────────────────────────────
   { name:"Гепатит", severity:"sick",
@@ -2136,6 +2959,19 @@ function analyzeWithKeywords(text) {
       });
     }
   }
+  const glossaryMatches = getDiagnosisGlossaryMatches(text);
+  glossaryMatches.forEach(({ entry }) => {
+    if (!entry?.organ_id) return;
+    const inferred = inferStatusFromConclusionText(text);
+    const severity = inferred && inferred !== "none" ? inferred : (entry.defaultSeverity || "warning");
+    results.push({
+      disease: entry.display_ru || entry.source_en || entry.canonical_key,
+      severity,
+      organs: [{ id: entry.organ_id, status: severity === "healthy" ? "healthy" : severity }],
+      confidence: 0.82,
+      source: "glossary",
+    });
+  });
   return results;
 }
 
@@ -2194,7 +3030,7 @@ function mergeAnalysisToOrgans(results) {
   const map = {};
   for (const r of results) {
     for (const o of (r?.organs || [])) {
-      const oid = canonicalizeOrganId(o.id);
+      const oid = resolveClinicalOrganId(o.id, r?.disease || "", r?.label || "", r?.summary || "");
       if (!oid) continue;
       const cur = map[oid];
       if (!cur || priority[o.status] > priority[cur]) {
@@ -2205,6 +3041,22 @@ function mergeAnalysisToOrgans(results) {
   return canonicalizeOrganMap(map);
 }
 
+const CLINICAL_STATUS_PRIORITY = { none: 0, healthy: 1, warning: 2, sick: 3 };
+
+function getDiagnosisGlossaryStatus(text) {
+  const matches = getDiagnosisGlossaryMatches(text);
+  if (!matches.length) return "";
+  let best = "";
+  matches.forEach(({ entry }) => {
+    const next = String(entry?.defaultSeverity || "").trim().toLowerCase();
+    if (!next) return;
+    if (!best || (CLINICAL_STATUS_PRIORITY[next] || 0) > (CLINICAL_STATUS_PRIORITY[best] || 0)) {
+      best = next;
+    }
+  });
+  return best;
+}
+
 function inferStatusFromConclusionText(text) {
   const src = String(text || "").trim();
   if (!src) return "none";
@@ -2213,8 +3065,9 @@ function inferStatusFromConclusionText(text) {
   if (hasNegation) return "healthy";
   if (/clinical[_\s-]?status\s*[:=]\s*resolved|\bresolved\b/i.test(t)) return "healthy";
   if (/clinical[_\s-]?status\s*[:=]\s*(inactive|remission)|\bremission\b|\binactive\b/i.test(t)) return "warning";
-  if (/malignant neoplasm|carcinoma|adenocarcinoma|sarcoma|lymphoma|leukemia|cancer|рак|карцинома|злокачеств/i.test(t)) return "sick";
   if (/\(person\)|\bperson\b/i.test(src)) return "healthy";
+  const glossaryStatus = getDiagnosisGlossaryStatus(src);
+  if (glossaryStatus === "none") return "none";
   if (/\(procedure\)|\bprocedure\b/i.test(src)) {
     if (/(complication|adverse|hemorrhag|bleed|perforat|infection|sepsis|shock|acute|injury|trauma|fracture|dislocation|iatrogenic|post[-\s]?op)/i.test(t)) return "sick";
     return "warning";
@@ -2229,8 +3082,50 @@ function inferStatusFromConclusionText(text) {
     if (/\bnormal\b|within normal|no abnormal|unremarkable|without significant findings|норма|без патологии/i.test(t)) return "healthy";
     return "warning";
   }
+  if (/malignant neoplasm|carcinoma|adenocarcinoma|sarcoma|lymphoma|leukemia|cancer|рак|карцинома|злокачеств/i.test(t)) return "sick";
   if (/(acute|остр[а-я]+)\s+(infar|stroke|sepsis|failure|bleed|fracture|bronchitis|pneumonia|панкреатит|инфаркт|инсульт|сепсис|недостаточност|кровотеч|перелом|пневмон)/i.test(t)) return "sick";
+  if (glossaryStatus) return glossaryStatus;
+  if (/\b(screening|referral|review due|follow[- ]up|consultation|checkup|wellness|скрининг|направление|контроль|консультац|профилактическ)/i.test(t)) return "warning";
   return "none";
+}
+
+function extractRowClinicalText(row, payloadOverride = null) {
+  const payload = payloadOverride || parseJsonObjectSafe(row?.payload);
+  return [
+    row?.study_type,
+    row?.findings,
+    row?.conclusion,
+    row?.notes,
+    payload?.conclusion,
+    payload?.condition_description,
+    payload?.notes,
+  ]
+    .map(v => String(v || "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+}
+
+function resolveRowClinicalStatus(row, rawStatusOverride = "") {
+  const payload = parseJsonObjectSafe(row?.payload);
+  const rawStatus =
+    rawStatusOverride ||
+    payload?.organ_status ||
+    payload?.clinical_status ||
+    payload?.status ||
+    row?.organ_status ||
+    row?.clinical_status ||
+    row?.status ||
+    "";
+  const base = normalizeClinicalStatus(rawStatus, row?.color, row?.subtype);
+  if (detectResolvedOutcome({ ...row, status: rawStatus }, base)) return "healthy";
+  const text = extractRowClinicalText(row, payload);
+  if (!text) return base;
+  const inferred = inferStatusFromConclusionText(text);
+  if (inferred && inferred !== "none") return inferred;
+  const glossaryStatus = getDiagnosisGlossaryStatus(text);
+  if (glossaryStatus) return glossaryStatus;
+  return base;
 }
 
 function inferMajorOrganIdFromMeshName(meshName, cat="visceral") {
@@ -2281,6 +3176,8 @@ function inferMajorOrganIdFromMeshName(meshName, cat="visceral") {
 
   if (cat === "visceral") {
     if (has(/parotid|submandibular|sublingual|parotid duct|submandibular duct/)) return "salivary_glands";
+    if (has(/gingiva|oral cavity|mouth|buccal mucosa|hard palate|soft palate|tooth|teeth|incisor|canine|premolar|molar|alveolar|dental arch|dental/)) return "oral_cavity";
+    if (has(/nasal cavity|nasal mucosa|nose|paranasal sinus|maxillary sinus|frontal sinus|ethmoidal sinus|ethmoid air cell|sphenoid sinus|inferior nasal concha|middle nasal concha|superior nasal concha|vomer/)) return "nasal_sinuses";
     if (has(/tongue|uvula|gingiva/)) return "tongue";
     if (has(/thyroid gland/)) return "thyroid";
     if (has(/parathyroid/)) return "parathyroid";
@@ -2315,7 +3212,10 @@ function inferMajorOrganIdFromMeshName(meshName, cat="visceral") {
   }
 
   if (cat === "skeletal") {
-    if (has(/parietal bone|frontal bone|occipital bone|sphenoid|ethmoid|temporal bone|maxilla|mandible|nasal bone|zygomatic|palatine bone|lacrimal bone|malleus|incus|stapes|tooth|incisor|canine|premolar|molar|inferior nasal concha|vomer/)) return "skull";
+    if (has(/\btooth\b|\bteeth\b|incisor|canine|premolar|molar|alveolar process|alveolar part|dental arch/)) return "oral_cavity";
+    if (has(/maxilla|mandible|palatine bone/)) return "skull";
+    if (has(/maxillary sinus|frontal sinus|ethmoidal sinus|ethmoid air cell|sphenoid sinus|nasal cavity|nasal bone|inferior nasal concha|middle nasal concha|superior nasal concha|vomer/)) return "nasal_sinuses";
+    if (has(/parietal bone|frontal bone|occipital bone|sphenoid|ethmoid|temporal bone|zygomatic|lacrimal bone|malleus|incus|stapes/)) return "skull";
     if (has(/\bhyoid\b/)) return "hyoid_laryngeal";
     // Vertebrae — split by region
     if (has(/\batlas\b|\baxis\b|vertebra c\d|cervical vertebra/)) return "cervical_spine";
@@ -2394,15 +3294,17 @@ function inferMajorOrganIdFromMeshName(meshName, cat="visceral") {
 function getMeshClinicalEntry(meshName, cat, odMap) {
   if (!odMap) return null;
   const direct = odMap[meshName];
-  if (direct) return direct;
+  if (direct) return suppressNonHeadClinicalEntryForHeadMesh(meshName, cat, direct);
 
   const normalizedMesh = normalizeMeshName(meshName);
   const directNormalized = odMap[normalizedMesh];
-  if (directNormalized) return { ...directNormalized, _derivedFrom: normalizedMesh };
+  if (directNormalized) {
+    return suppressNonHeadClinicalEntryForHeadMesh(meshName, cat, { ...directNormalized, _derivedFrom: normalizedMesh });
+  }
 
   const majorId = canonicalizeOrganId(inferMajorOrganIdFromMeshName(meshName, cat));
   if (majorId && odMap[majorId]) {
-    return { ...odMap[majorId], organ_id: majorId, _derivedFrom: majorId };
+    return suppressNonHeadClinicalEntryForHeadMesh(meshName, cat, { ...odMap[majorId], organ_id: majorId, _derivedFrom: majorId });
   }
   if (majorId) {
     const sidedFallback = {
@@ -2417,14 +3319,14 @@ function getMeshClinicalEntry(meshName, cat, odMap) {
     };
     const baseId = sidedFallback[majorId];
     if (baseId && odMap[baseId]) {
-      return { ...odMap[baseId], organ_id: majorId, _derivedFrom: baseId };
+      return suppressNonHeadClinicalEntryForHeadMesh(meshName, cat, { ...odMap[baseId], organ_id: majorId, _derivedFrom: baseId });
     }
   }
 
   const legacyId = inferMajorOrganIdFromMeshName(meshName, cat);
   if (legacyId && odMap[legacyId]) {
     const canonical = canonicalizeOrganId(legacyId);
-    return { ...odMap[legacyId], organ_id: canonical || legacyId, _derivedFrom: legacyId };
+    return suppressNonHeadClinicalEntryForHeadMesh(meshName, cat, { ...odMap[legacyId], organ_id: canonical || legacyId, _derivedFrom: legacyId });
   }
   return null;
 }
@@ -2465,14 +3367,13 @@ function NLPInsightBadge({ results, isAnalyzing }) {
     <div style={{marginTop:7,padding:"8px 10px",borderRadius:9,background:"rgba(3,194,252,0.05)",border:"1px solid rgba(3,194,252,0.15)"}}>
       <div style={{fontSize:8,fontWeight:700,color:"#03C2FC",letterSpacing:"0.07em",marginBottom:6,textTransform:"uppercase"}}>
          Автодиагностика по тексту
-        <span style={{color:C.muted,fontWeight:400,marginLeft:6,textTransform:"none",fontSize:8}}>Gemini/правила</span>
       </div>
       <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
         {results.map((r,i)=>{
           const sc = r.severity==="sick"?"#ef4444":r.severity==="warning"?"#f97316":"#10b981";
           return (
             <div key={i} style={{fontSize:9,padding:"2px 8px",borderRadius:10,border:`1px solid ${sc}40`,background:`${sc}10`,color:sc,fontWeight:600}}>
-              {r.disease}
+              {translateMedicalDisplay(r.disease || "", { kind: "diagnosis" }) || r.disease}
             </div>
           );
         })}
@@ -3734,7 +4635,7 @@ if (xr) {
   mesh.renderOrder = isSel ? 220 : isHover ? 210 : criticalRankXray === 2 ? 200 : criticalRankXray === 1 ? 180 : 0;
   if (stNow && stNow !== "none") {
     const xrayStatusOpacity = outlineOnly
-      ? (isFocus ? 0.96 : 0.88)
+      ? (isFocus ? 0.42 : 0.28)
       : isCriticalStatus
         ? (isFocus ? 0.74 : 0.58)
         : (isFocus ? 0.48 : 0.34);
@@ -3755,7 +4656,7 @@ if (xr) {
       }
       if (mat && mat.emissive) {
         if (outlineOnly) {
-          mat.emissive.setHex(stNow === "sick" ? 0x3a0d14 : 0x3a2308);
+          mat.emissive.setHex(stNow === "sick" ? 0x19070b : 0x1d1406);
         } else {
           mat.emissive.setHex(
             stNow === "sick" ? 0x2b0a10 :
@@ -3823,8 +4724,8 @@ const np = normalOpacity[cat] || normalOpacity.visceral;
 const hex = outlineOnlyNormal ? normalOutlineHex : (STATUS_HEX[disp] ?? STATUS_HEX.none);
 const isCriticalStatus = disp === "sick" || disp === "warning";
 const opacity = critOnly
-  ? (isCriticalStatus ? (outlineOnlyNormal ? (isFocus ? 0.96 : 0.88) : np.active) : 0)
-  : (disp === "none" ? np.none : (outlineOnlyNormal ? (isFocus ? 0.93 : 0.84) : np.active));
+  ? (isCriticalStatus ? (outlineOnlyNormal ? (isFocus ? 0.34 : 0.24) : np.active) : 0)
+  : (disp === "none" ? np.none : (outlineOnlyNormal ? (isFocus ? 0.30 : 0.22) : np.active));
 const criticalRankNormal = headRegion ? 0 : (disp === "sick" ? 2 : disp === "warning" ? 1 : 0);
 mesh.renderOrder = isSel ? 220 : isHover ? 210 : criticalRankNormal === 2 ? 200 : criticalRankNormal === 1 ? 180 : 0;
 const forceOnTop = isCriticalStatus && opacity > 0 && !headRegion;
@@ -5014,6 +5915,8 @@ function ScanDescriptionEditor({ oid, pid, existingDesc }) {
   const [text, setText] = useState(existingDesc||"");
   const [saved, setSaved] = useState(false);
   const { results, isAnalyzing } = useTextAnalysis(text);
+  const displayText = translateMedicalDisplay(text || "", { kind: "conclusion", organId: oid }) || text;
+  const showDisplayText = displayText && normalizeMedicalSearchText(displayText) !== normalizeMedicalSearchText(stripSemanticTag(text));
 
   const save = () => {
     dbRun("UPDATE organ_data SET findings=? WHERE patient_id=? AND organ_id=?", [text, pid, oid]);
@@ -5030,6 +5933,11 @@ function ScanDescriptionEditor({ oid, pid, existingDesc }) {
           — ИИ-анализ подключится автоматически
         </span>
       </div>
+      {showDisplayText && (
+        <div style={{marginBottom:6,padding:"7px 10px",background:"rgba(3,194,252,0.08)",border:`1px solid ${C.border}`,borderRadius:8,fontSize:10,color:C.text,lineHeight:1.55}}>
+          {displayText}
+        </div>
+      )}
       <textarea
         value={text}
         onChange={e=>setText(e.target.value)}
@@ -5109,7 +6017,7 @@ function OrganDetail({ pid, oid, isDoctor }) {
               : <div style={{fontSize:11,color:C.muted,marginTop:2}}>Исследований не проводилось</div>
             }
           </div>
-          {data&&<div style={{fontSize:9,padding:"4px 10px",borderRadius:14,background:`${sc}12`,border:`1px solid ${sc}20`,color:sc,fontWeight:700,whiteSpace:"nowrap",letterSpacing:"0.04em"}}>{data.study_type||"—"}</div>}
+          {data&&<div style={{fontSize:9,padding:"4px 10px",borderRadius:14,background:`${sc}12`,border:`1px solid ${sc}20`,color:sc,fontWeight:700,whiteSpace:"nowrap",letterSpacing:"0.04em"}}>{translateMedicalDisplay(data.study_type || "", { kind: "study_type" }) || "—"}</div>}
         </div>
       </div>
 
@@ -5123,7 +6031,7 @@ function OrganDetail({ pid, oid, isDoctor }) {
         <div style={{padding:"13px 16px"}}>
           {/* meta grid */}
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,marginBottom:13}}>
-            {[["Исследование",data.study_type||"—"],["Дата",data.study_date||"—"]].map(([k,v])=>(
+            {[["Исследование",translateMedicalDisplay(data.study_type || "", { kind: "study_type" }) || "—"],["Дата",data.study_date||"—"]].map(([k,v])=>(
               <div key={k} style={{background:C.bg3,borderRadius:8,padding:"9px 11px",border:`1px solid ${C.border}`}}>
                 <div style={{fontSize:8,color:C.muted,fontWeight:700,letterSpacing:0.7,textTransform:"uppercase",marginBottom:3}}>{k}</div>
                 <div style={{fontSize:12,color:C.text,fontWeight:600}}>{v}</div>
@@ -5155,7 +6063,7 @@ function OrganDetail({ pid, oid, isDoctor }) {
           {/* findings */}
           <div style={{marginBottom:13}}>
             <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:7}}> Заключение</div>
-            <div style={{background:`${sc}08`,border:`1px solid ${sc}18`,borderLeft:`3px solid ${sc}`,borderRadius:8,padding:"11px 13px",fontSize:12,color:C.text,lineHeight:1.75}}>{data.findings}</div>
+            <div style={{background:`${sc}08`,border:`1px solid ${sc}18`,borderLeft:`3px solid ${sc}`,borderRadius:8,padding:"11px 13px",fontSize:12,color:C.text,lineHeight:1.75}}>{translateMedicalDisplay(data.findings || "", { kind: "conclusion", organId: oid, studyType: data.study_type }) || data.findings}</div>
           </div>
           {/* lab values */}
           {Object.keys(labValues).length>0&&(
@@ -5232,7 +6140,7 @@ function OrgSummary({ pid }) {
           <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:5}}> Выявленные патологии</div>
           {sick.map(r=>(
             <div key={r.organ_id} style={{background:"rgba(239,68,68,0.07)",border:`1px solid rgba(239,68,68,0.17)`,borderLeft:`3px solid ${C.red2}`,borderRadius:8,padding:"9px 13px",fontSize:12,color:C.text,lineHeight:1.65,marginBottom:6}}>
-              <span style={{fontWeight:700,color:C.red2}}>{OM[r.organ_id]?.n||r.organ_id}: </span>{r.findings}
+              <span style={{fontWeight:700,color:C.red2}}>{OM[r.organ_id]?.n||r.organ_id}: </span>{translateMedicalDisplay(r.findings || "", { kind: "conclusion", organId: r.organ_id, studyType: r.study_type }) || r.findings}
             </div>
           ))}
         </div>
@@ -5242,7 +6150,7 @@ function OrgSummary({ pid }) {
           <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:0.8,textTransform:"uppercase",marginBottom:5}}> Требует наблюдения</div>
           {warn.map(r=>(
             <div key={r.organ_id} style={{background:"rgba(249,115,22,0.07)",border:`1px solid rgba(249,115,22,0.17)`,borderLeft:`3px solid ${C.orange2}`,borderRadius:8,padding:"9px 13px",fontSize:12,color:C.text,lineHeight:1.65,marginBottom:6}}>
-              <span style={{fontWeight:700,color:C.orange2}}>{OM[r.organ_id]?.n||r.organ_id}: </span>{r.findings}
+              <span style={{fontWeight:700,color:C.orange2}}>{OM[r.organ_id]?.n||r.organ_id}: </span>{translateMedicalDisplay(r.findings || "", { kind: "conclusion", organId: r.organ_id, studyType: r.study_type }) || r.findings}
             </div>
           ))}
         </div>
@@ -5538,6 +6446,7 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
   externalCriticalOnlyMode, externalSetCriticalOnlyMode,
   externalNav, onSceneReady, onHoverOverlayChange,
   cardsFrozen = false, maxHoverCards = 8, qualitySettings = loadQualitySettings(),
+  selectedStudyDate = "",
 }) {
   useDB();
   const effectiveQuality = clampQualitySettings(qualitySettings || QUALITY_DEFAULTS);
@@ -5545,11 +6454,7 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
   const [hoverInfo, setHoverInfo] = useState(null);
   const [layers, setLayers] = useState({ skeletal:true, muscular:true, cardiovascular:true, visceral:true, nervous:true, skin:true, joints:true, lymphoid:true });
   const [_groups, _setGroups] = useState([]);
-  const [_groupVis, _setGroupVis] = useState(() => {
-    const initial = {};
-    TARGET_GROUPS.forEach(g => { initial[g.name] = g.defaultOn !== false; });
-    return initial;
-  });
+  const [_groupVis, _setGroupVis] = useState(() => buildDefaultGroupVisibility());
   const [_showGroupPanel, _setShowGroupPanel] = useState(false);
   const [_xrayMode, _setXrayMode] = useState(true);
   const [_criticalOnlyMode, _setCriticalOnlyMode] = useState(false);
@@ -5573,7 +6478,7 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
     if (grps.length > 0 && !externalToolbar) {
       _setGroupVis(prev => {
         const next = {};
-        TARGET_GROUPS.forEach(g => { next[g.name] = prev[g.name] !== undefined ? prev[g.name] : true; });
+        TARGET_GROUPS.forEach(g => { next[g.name] = prev[g.name] !== undefined ? prev[g.name] : (g.defaultOn !== false); });
         return next;
       });
     }
@@ -5602,7 +6507,17 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
   const aiRow = dbGetOne("SELECT * FROM organ_data WHERE patient_id=? AND organ_id='__ai__'", [pid]);
   let aiData = {};
   try { aiData = JSON.parse(aiRow?.findings || "{}"); } catch {}
-  const aiOrganMap = canonicalizeOrganMap(aiData.organMap || {});
+  const aiOrganMap = useMemo(() => {
+    const fromResults = Array.isArray(aiData?.results) ? mergeAnalysisToOrgans(aiData.results) : {};
+    if (Object.keys(fromResults).length) return fromResults;
+    const fallback = {};
+    Object.entries(aiData?.organMap || {}).forEach(([oid, status]) => {
+      const resolvedOrganId = resolveClinicalOrganId(oid, aiData?.text || "");
+      if (!resolvedOrganId) return;
+      fallback[resolvedOrganId] = status;
+    });
+    return canonicalizeOrganMap(fallback);
+  }, [aiRow?.findings || ""]);
   const [timelineNowMs, setTimelineNowMs] = useState(() => Date.now());
 
   useEffect(() => {
@@ -5637,6 +6552,14 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
   }, [timelineNowMs, timelineSourceRows.map(r => `${r.organ_id}|${r.status}|${timelineRowDate(r)}|${r.study_type}|${r.findings}|${r.notes}`).join("||")]);
   const timelineEntries = timelineModel.entries || [];
   const timelineTasks = timelineModel.tasks || [];
+  const preferredTimelineIdx = useMemo(
+    () => getPreferredTimelineIndex(timelineEntries),
+    [timelineEntries.map(e => `${e.date || ""}|${e.timestamp || 0}|${e.hasCritical ? 1 : 0}|${e.isTodayMarker ? 1 : 0}`).join("||")]
+  );
+  const timelineAutoSelectKey = useMemo(
+    () => `${pid}|${timelineEntries.map(e => `${e.date || ""}|${e.timestamp || 0}|${e.hasCritical ? 1 : 0}|${e.isTodayMarker ? 1 : 0}`).join("||")}`,
+    [pid, timelineEntries.map(e => `${e.date || ""}|${e.timestamp || 0}|${e.hasCritical ? 1 : 0}|${e.isTodayMarker ? 1 : 0}`).join("||")]
+  );
 
   const safeIdx = Math.min(timeIdx, Math.max(0, timelineEntries.length-1));
   const effectiveMaxHoverCards = Math.max(
@@ -5647,14 +6570,57 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
     )
   );
 
-  // Auto-jump to latest entry when new study is added
-  const prevLen = useRef(0);
-  useEffect(()=>{
-    if(timelineEntries.length > prevLen.current) {
-      setTimeIdx(timelineEntries.length - 1);
+  // Auto-select latest abnormal event (red/orange). Fallback: latest real event.
+  const prevTimelineAutoKeyRef = useRef("");
+  useEffect(() => {
+    if (selectedStudyDate) return;
+    if (!timelineEntries.length) {
+      setTimeIdx(0);
+      prevTimelineAutoKeyRef.current = timelineAutoSelectKey;
+      return;
     }
-    prevLen.current = timelineEntries.length;
-  }, [timelineEntries.length]);
+    if (prevTimelineAutoKeyRef.current !== timelineAutoSelectKey) {
+      setTimeIdx(preferredTimelineIdx);
+      prevTimelineAutoKeyRef.current = timelineAutoSelectKey;
+    }
+  }, [selectedStudyDate, timelineEntries.length, preferredTimelineIdx, timelineAutoSelectKey]);
+
+  useEffect(() => {
+    const targetTs = parseTimelineDate(selectedStudyDate);
+    if (!timelineEntries.length || targetTs === null || targetTs === undefined) return;
+    let bestIdx = 0;
+    let bestDelta = Math.abs((timelineEntries[0]?.timestamp || 0) - targetTs);
+    for (let i = 1; i < timelineEntries.length; i++) {
+      const delta = Math.abs((timelineEntries[i]?.timestamp || 0) - targetTs);
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        bestIdx = i;
+      }
+    }
+    setTimeIdx(bestIdx);
+  }, [
+    selectedStudyDate,
+    timelineEntries.map(e => `${e.date || ""}|${e.timestamp || 0}`).join("||"),
+  ]);
+
+  const selectedStudyTimestamp = parseTimelineDate(selectedStudyDate);
+  const hasPinnedStudySelection =
+    selectedStudyTimestamp !== null &&
+    selectedStudyTimestamp !== undefined &&
+    Number.isFinite(selectedStudyTimestamp);
+  const effectiveTimelineEntry = timelineEntries.length
+    ? (
+        (showTimeline || hasPinnedStudySelection)
+          ? (timelineEntries[safeIdx] || timelineEntries[timelineEntries.length - 1])
+          : timelineEntries[timelineEntries.length - 1]
+      )
+    : null;
+  const allowGlobalAiOverlay =
+    !timelineEntries.length ||
+    (!showTimeline && !hasPinnedStudySelection) ||
+    safeIdx >= timelineEntries.length - 1 ||
+    !!effectiveTimelineEntry?.isTodayMarker;
+  const effectiveSourceRows = effectiveTimelineEntry?.snapshot || effectiveTimelineEntry?.organs || odRows;
 
   // NLP: analyse all text fields from current snapshot and merge into od
   // DB explicit status always wins over NLP; NLP only fills "none" or upgrades severity
@@ -5662,32 +6628,33 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
 
   const nlpOrganMap = useMemo(()=>{
     // Collect all text: findings + notes from the current source rows
-    const source = timelineEntries.length
-      ? (
-          showTimeline
-            ? (timelineEntries[safeIdx]?.snapshot || timelineEntries[safeIdx]?.organs || odRows)
-            : (timelineEntries[timelineEntries.length - 1]?.snapshot || timelineEntries[timelineEntries.length - 1]?.organs || odRows)
-        )
-      : odRows;
-    const allText = (Array.isArray(source)?source:odRows)
-      .map(r=>[r.findings||"", r.notes||""].join(" ")).join(" ");
+    const activeRows = (Array.isArray(effectiveSourceRows) ? effectiveSourceRows : odRows)
+      .filter(r => {
+        const timelineDisplay = r?._timeline?.displayStatus;
+        if (timelineDisplay !== undefined) return timelineDisplay !== "none";
+        return resolveRowClinicalStatus(r, r?.status) !== "none";
+      });
+    const allText = activeRows
+      .map(r=>extractRowClinicalText(r)).filter(Boolean).join(" ");
     return mergeAnalysisToOrgans(analyzeWithKeywords(allText));
   }, [
-    odRows.map(r=>r.findings+r.notes).join('|'),
-    showTimeline, safeIdx, timelineEntries.length
+    odRows.map(r=>`${r.findings || ""}|${r.notes || ""}|${r.status || ""}`).join('|'),
+    showTimeline, safeIdx, timelineEntries.length, selectedStudyDate
   ]);
 
   // Merge: DB status takes priority; NLP fills gaps or upgrades where DB has "none"
   const od = useMemo(()=>{
-    const source = timelineEntries.length
-      ? (
-          showTimeline
-            ? (timelineEntries[safeIdx]?.snapshot || timelineEntries[safeIdx]?.organs || odRows)
-            : (timelineEntries[timelineEntries.length - 1]?.snapshot || timelineEntries[timelineEntries.length - 1]?.organs || odRows)
-        )
-      : odRows;
     const m = {};
-    (Array.isArray(source)?source:odRows).forEach(r=>{ m[r.organ_id]={...r}; });
+    (Array.isArray(effectiveSourceRows) ? effectiveSourceRows : odRows).forEach(r => {
+      const resolvedOrganId = resolveClinicalOrganId(r?.organ_id || "", r?.study_type, r?.findings, r?.notes);
+      if (!resolvedOrganId) return;
+      m[resolvedOrganId] = {
+        ...r,
+        status: resolveRowClinicalStatus(r, r?.status),
+        organ_id: resolvedOrganId,
+        _source_organ_id: r?.organ_id || "",
+      };
+    });
 
     const applyAssistantMap = (assistantMap, flagName) => {
       Object.entries(assistantMap || {}).forEach(([oid, nextStatus])=>{
@@ -5702,13 +6669,15 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
       });
     };
 
-    applyAssistantMap(aiOrganMap, "_ai");
+    if (allowGlobalAiOverlay) {
+      applyAssistantMap(aiOrganMap, "_ai");
+    }
     applyAssistantMap(nlpOrganMap, "_nlp");
     return m;
   }, [
-    odRows.map(r=>r.organ_id+r.status+r.study_date).join(','),
-    showTimeline, timeIdx, timelineEntries.length,
-    JSON.stringify(nlpOrganMap), JSON.stringify(aiOrganMap)
+    odRows.map(r=>`${r.organ_id}|${r.status}|${r.study_date}|${r.study_type || ""}|${r.findings || ""}|${r.notes || ""}`).join(','),
+    showTimeline, timeIdx, timelineEntries.length, selectedStudyDate,
+    JSON.stringify(nlpOrganMap), JSON.stringify(aiOrganMap), allowGlobalAiOverlay
   ]);
 
   const toggleLayer = id => setLayers(l=>({...l,[id]:!l[id]}));
@@ -5717,7 +6686,7 @@ function ModelPanel({ pid, gender, isDoctor, isMobile, onOrganSelect, selOrgan, 
     if (!criticalOnlyMode) return od;
     const filtered = {};
     Object.entries(od || {}).forEach(([organId, row]) => {
-      const st = row?._nlpUpgrade || row?.status || "none";
+      const st = row?._timeline?.displayStatus || row?._nlpUpgrade || row?.status || "none";
       filtered[organId] = (st === "sick" || st === "warning")
         ? row
         : { ...(row || { organ_id: organId }), status: "none" };
@@ -6239,12 +7208,21 @@ function mapTimelineItemToClinicalRow(row) {
     row?.clinical_status ||
     row?.status ||
     "";
-  const status = normalizeClinicalStatus(statusCandidate, row?.color, row?.subtype);
+  const status = resolveRowClinicalStatus(row, statusCandidate);
+  const organId = resolveClinicalOrganId(
+    row?.organ_id || payload?.organ_id || "",
+    row?.study_type,
+    row?.conclusion,
+    payload?.conclusion,
+    payload?.condition_description,
+    payload?.notes
+  );
   return {
-    organ_id: canonicalizeOrganId(row?.organ_id || payload?.organ_id || ""),
+    organ_id: organId,
     status: status || "none",
     study_type: row?.study_type || payload?.study_type || "",
-    study_date: row?.date_iso || payload?.date || "",
+    study_date: formatStudyDateDisplay(row?.date_iso || payload?.date || ""),
+    date_iso: row?.date_iso || payload?.date || "",
     findings: row?.conclusion || payload?.conclusion || "",
     notes: row?.notes || payload?.notes || "",
     ai_confidence: row?.ai_confidence,
@@ -6254,10 +7232,18 @@ function mapTimelineItemToClinicalRow(row) {
   };
 }
 
+function mapOrganDataRowToClinicalRow(row) {
+  return {
+    ...row,
+    status: resolveRowClinicalStatus(row, row?.status),
+    organ_id: resolveClinicalOrganId(row?.organ_id || "", row?.study_type, row?.findings, row?.notes),
+  };
+}
+
 function getPatientTimelineSourceRows(patientId) {
   const tlRows = dbQuery("SELECT * FROM timeline_items WHERE patient_id=? ORDER BY date_iso ASC", [patientId]);
   if (!tlRows.length) {
-    return dbQuery("SELECT * FROM organ_data WHERE patient_id=? AND organ_id NOT IN ('__record__','__ai__')", [patientId]);
+    return dbQuery("SELECT * FROM organ_data WHERE patient_id=? AND organ_id NOT IN ('__record__','__ai__')", [patientId]).map(mapOrganDataRowToClinicalRow);
   }
   return tlRows.map(mapTimelineItemToClinicalRow).filter(r => r.organ_id);
 }
@@ -6277,6 +7263,12 @@ function timelineShortDate(dateStr) {
   if (!ms) return String(dateStr || "—");
   const d = new Date(ms);
   return `${String(d.getUTCDate()).padStart(2, "0")}.${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function formatStudyDateDisplay(dateStr) {
+  const ms = parseTimelineDate(dateStr);
+  if (!ms) return String(dateStr || "—");
+  return new Date(ms).toLocaleDateString("ru-RU");
 }
 
 function timelineLocalDateKey(ms = Date.now()) {
@@ -6352,96 +7344,140 @@ function computeTimelinePriority({ signal, aiConfidence, clinicalSeverity, ageDa
   return cp * 100 + Math.round((aiConfidence || 0) * 30) + Math.round((clinicalSeverity || 0) * 30) + overdueBoost - agePenalty;
 }
 
+function buildTimelineRowMeta(row, referenceTs = Date.now(), ttlConfig = TL_DEFAULT_TTL_DAYS) {
+  const rowDate = timelineRowDate(row);
+  const ts = parseTimelineDate(rowDate) ?? referenceTs;
+  const ageDays = Math.max(0, (referenceTs - ts) / 86400000);
+  const subtype = detectTimelineSubtype(row);
+  const scheduledPending = detectScheduledPending(row);
+  const normalizedStatus = resolveRowClinicalStatus(row, row?.status);
+  const healed = detectResolvedOutcome(row, normalizedStatus);
+  const baseSignal = subtype === "technical" ? "blue" : (TL_STATUS_TO_SIGNAL[normalizedStatus] || "gray");
+  const ttlDays = resolveTtlDays(row, baseSignal, ttlConfig);
+  const basePhase = scheduledPending ? "overdue" : computeTimelinePhase(ageDays, ttlDays);
+  const isCriticalSignal = baseSignal === "red" || baseSignal === "orange";
+  const outlineDueToPending = scheduledPending && isCriticalSignal;
+  const expired = !healed && basePhase === "stale";
+  const outlineDueToAge = !expired && ageDays >= TL_OUTLINE_AFTER_DAYS && isCriticalSignal;
+  const outlineOnly = !healed && !expired && (outlineDueToPending || outlineDueToAge);
+  const phase = healed ? "resolved" : basePhase;
+  const visualSignal = (healed || expired)
+    ? "gray"
+    : (outlineOnly ? baseSignal : (basePhase === "overdue" ? "yellow" : (basePhase === "stale" ? "gray" : baseSignal)));
+  const aiConfidence = normalizeAiConfidence(row);
+  const displayStatus = (healed || expired) ? "none" : normalizedStatus;
+  const clinicalSeverity = displayStatus === "sick" ? 1 : displayStatus === "warning" ? 0.7 : 0.2;
+  const priorityScore = (healed || expired) ? 0 : computeTimelinePriority({
+    signal: baseSignal,
+    aiConfidence,
+    clinicalSeverity,
+    ageDays,
+    phase: basePhase,
+  });
+  return {
+    timestamp: ts,
+    ageDays,
+    ttlDays,
+    phase,
+    basePhase,
+    subtype,
+    signal: baseSignal,
+    visualSignal,
+    displayStatus,
+    aiConfidence,
+    priorityScore,
+    healed,
+    expired,
+    scheduledPending: (healed || expired) ? false : scheduledPending,
+    isOverdue: !healed && !expired && basePhase === "overdue",
+    isCritical: !healed && !expired && isCriticalSignal,
+    outlineOnly,
+    outlineSignal: outlineOnly ? baseSignal : "",
+    outlineReason: outlineDueToPending ? "scheduled_pending" : (outlineDueToAge ? "ttl_90d" : ""),
+    hex: (healed || expired)
+      ? TL_BASE_COLORS.gray
+      : (outlineOnly ? timelineHexBySignalPhase(baseSignal, "bright") : timelineHexBySignalPhase(visualSignal, basePhase)),
+  };
+}
+
+function summarizeTimelineSnapshot(rows = []) {
+  const snapshotRows = Array.isArray(rows) ? rows : [];
+  const top = snapshotRows
+    .map(o => o._timeline || {})
+    .sort((a, b) => (b.priorityScore || 0) - (a.priorityScore || 0))[0] || {};
+  const hasCritical = snapshotRows.some(o => o._timeline?.isCritical);
+  const hasOverdue = snapshotRows.some(o => o._timeline?.isOverdue);
+  const scheduledPendingCount = snapshotRows.filter(o => o._timeline?.scheduledPending).length;
+  const displayStatuses = snapshotRows.map(o => o._timeline?.displayStatus || o.status || "none");
+  return {
+    worstStatus: hasCritical ? (displayStatuses.some(s => s === "sick") ? "sick" : "warning")
+      : (displayStatuses.some(s => s === "healthy") ? "healthy" : "none"),
+    worstSignal: top.visualSignal || "gray",
+    worstHex: top.hex || TL_BASE_COLORS.gray,
+    priorityScore: top.priorityScore || 0,
+    hasCritical,
+    hasOverdue,
+    scheduledPendingCount,
+  };
+}
+
+function getPreferredTimelineIndex(entries = []) {
+  const list = Array.isArray(entries) ? entries : [];
+  if (!list.length) return 0;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (!list[i]?.isTodayMarker && list[i]?.hasCritical) return i;
+  }
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (!list[i]?.isTodayMarker) return i;
+  }
+  return Math.max(0, list.length - 1);
+}
+
 function buildClinicalTimelineModel(rows, nowMs = Date.now(), ttlConfig = TL_DEFAULT_TTL_DAYS) {
   const byDate = {};
   (rows || []).forEach(r => {
     const rowDate = timelineRowDate(r);
     const ts = parseTimelineDate(rowDate) ?? nowMs;
-    const ageDays = Math.max(0, (nowMs - ts) / 86400000);
-    const subtype = detectTimelineSubtype(r);
-    const scheduledPending = detectScheduledPending(r);
-    const normalizedStatus = normalizeClinicalStatus(r?.status, r?.color, r?.subtype);
-    const healed = detectResolvedOutcome(r, normalizedStatus);
-    const baseSignal = subtype === "technical" ? "blue" : (TL_STATUS_TO_SIGNAL[normalizedStatus] || "gray");
-    const ttlDays = resolveTtlDays(r, baseSignal, ttlConfig);
-    const basePhase = scheduledPending ? "overdue" : computeTimelinePhase(ageDays, ttlDays);
-    const isCriticalSignal = baseSignal === "red" || baseSignal === "orange";
-    const outlineDueToPending = scheduledPending && isCriticalSignal;
-    const outlineDueToAge = ageDays >= TL_OUTLINE_AFTER_DAYS && isCriticalSignal;
-    const outlineOnly = !healed && (outlineDueToPending || outlineDueToAge);
-    const phase = healed ? "resolved" : basePhase;
-    const visualSignal = healed
-      ? "gray"
-      : (outlineOnly ? baseSignal : (basePhase === "overdue" ? "yellow" : (basePhase === "stale" ? "gray" : baseSignal)));
-    const aiConfidence = normalizeAiConfidence(r);
-    const displayStatus = healed ? "none" : normalizedStatus;
-    const clinicalSeverity = displayStatus === "sick" ? 1 : displayStatus === "warning" ? 0.7 : 0.2;
-    const priorityScore = healed ? 0 : computeTimelinePriority({
-      signal: baseSignal,
-      aiConfidence,
-      clinicalSeverity,
-      ageDays,
-      phase: basePhase,
-    });
-    const timelineMeta = {
-      timestamp: ts,
-      ageDays,
-      ttlDays,
-      phase,
-      basePhase,
-      subtype,
-      signal: baseSignal,
-      visualSignal,
-      displayStatus,
-      aiConfidence,
-      priorityScore,
-      healed,
-      scheduledPending: healed ? false : scheduledPending,
-      isOverdue: !healed && basePhase === "overdue",
-      isCritical: !healed && isCriticalSignal,
-      outlineOnly,
-      outlineSignal: outlineOnly ? baseSignal : "",
-      outlineReason: outlineDueToPending ? "scheduled_pending" : (outlineDueToAge ? "ttl_90d" : ""),
-      hex: healed
-        ? TL_BASE_COLORS.gray
-        : (outlineOnly ? timelineHexBySignalPhase(baseSignal, "bright") : timelineHexBySignalPhase(visualSignal, basePhase)),
-    };
+    const normalizedStatus = resolveRowClinicalStatus(r, r?.status);
     const dateKey = rowDate || "Неизвестно";
     if (!byDate[dateKey]) byDate[dateKey] = { date: dateKey, timestamp: ts, organs: [] };
     byDate[dateKey].timestamp = Math.max(byDate[dateKey].timestamp, ts);
-    byDate[dateKey].organs.push({ ...r, status: normalizedStatus, _timeline: timelineMeta });
+    byDate[dateKey].organs.push({ ...r, status: normalizedStatus });
   });
 
   const sortedEntries = Object.values(byDate).sort((a, b) => a.timestamp - b.timestamp);
   const rollingOrganState = new Map();
   const entries = sortedEntries.map(entry => {
-      (entry.organs || []).forEach(orgRow => {
-        const oid = canonicalizeOrganId(orgRow.organ_id || "");
-        if (!oid) return;
-        rollingOrganState.set(oid, { ...orgRow, organ_id: oid });
-      });
-      const organs = entry.organs || [];
-      const top = organs
-        .map(o => o._timeline || {})
-        .sort((a, b) => (b.priorityScore || 0) - (a.priorityScore || 0))[0] || {};
-      const hasCritical = organs.some(o => o._timeline?.isCritical);
-      const hasOverdue = organs.some(o => o._timeline?.isOverdue);
-      const scheduledPendingCount = organs.filter(o => o._timeline?.scheduledPending).length;
-      const displayStatuses = organs.map(o => o._timeline?.displayStatus || o.status || "none");
-      return {
-        ...entry,
-        shortDate: timelineShortDate(entry.date),
-        snapshot: Array.from(rollingOrganState.values()).map(v => ({ ...v })),
-        worstStatus: hasCritical ? (displayStatuses.some(s => s === "sick") ? "sick" : "warning")
-          : (displayStatuses.some(s => s === "healthy") ? "healthy" : "none"),
-        worstSignal: top.visualSignal || "gray",
-        worstHex: top.hex || TL_BASE_COLORS.gray,
-        priorityScore: top.priorityScore || 0,
-        hasCritical,
-        hasOverdue,
-        scheduledPendingCount,
-      };
+    (entry.organs || []).forEach(orgRow => {
+      const oid = canonicalizeOrganId(orgRow.organ_id || "");
+      if (!oid) return;
+      rollingOrganState.set(oid, { ...orgRow, organ_id: oid });
     });
+    const entryRows = (entry.organs || []).map(orgRow => ({
+      ...orgRow,
+      _timeline: buildTimelineRowMeta(orgRow, entry.timestamp, ttlConfig),
+    }));
+    const snapshotRows = Array.from(rollingOrganState.values()).map(v => ({
+      ...v,
+      _timeline: buildTimelineRowMeta(v, entry.timestamp, ttlConfig),
+    }));
+    return {
+      ...entry,
+      organs: entryRows,
+      shortDate: timelineShortDate(entry.date),
+      snapshot: snapshotRows,
+      ...summarizeTimelineSnapshot(snapshotRows),
+    };
+  });
+
+  const buildCurrentSnapshot = (referenceTs) => (
+    Array.from(rollingOrganState.values()).map(v => ({
+      ...v,
+      _timeline: buildTimelineRowMeta(v, referenceTs, ttlConfig),
+    }))
+  );
+  const currentSnapshot = buildCurrentSnapshot(nowMs);
+  const currentSummary = summarizeTimelineSnapshot(currentSnapshot);
 
   const todayKey = timelineLocalDateKey(nowMs);
   let todayIdx = -1;
@@ -6454,7 +7490,18 @@ function buildClinicalTimelineModel(rows, nowMs = Date.now(), ttlConfig = TL_DEF
   }
 
   if (todayIdx >= 0) {
-    entries[todayIdx] = { ...entries[todayIdx], isTodayMarker: true };
+    const todayEntry = entries[todayIdx];
+    const todayEventRows = (todayEntry?.organs || []).map(orgRow => ({
+      ...orgRow,
+      _timeline: buildTimelineRowMeta(orgRow, nowMs, ttlConfig),
+    }));
+    entries[todayIdx] = {
+      ...todayEntry,
+      organs: todayEventRows,
+      snapshot: currentSnapshot.map(v => ({ ...v })),
+      ...currentSummary,
+      isTodayMarker: true,
+    };
   } else {
     const latest = entries.length ? entries[entries.length - 1] : null;
     const baseTodayTs = parseTimelineDate(todayKey) ?? nowMs;
@@ -6464,33 +7511,27 @@ function buildClinicalTimelineModel(rows, nowMs = Date.now(), ttlConfig = TL_DEF
       shortDate: timelineShortDate(todayKey),
       timestamp: markerTs,
       organs: [],
-      snapshot: Array.isArray(latest?.snapshot) ? latest.snapshot.map(v => ({ ...v })) : [],
-      worstStatus: latest?.worstStatus || "none",
-      worstSignal: latest?.worstSignal || "gray",
-      worstHex: latest?.worstHex || TL_BASE_COLORS.gray,
-      priorityScore: latest?.priorityScore || 0,
-      hasCritical: !!latest?.hasCritical,
-      hasOverdue: !!latest?.hasOverdue,
-      scheduledPendingCount: Number(latest?.scheduledPendingCount || 0),
+      snapshot: currentSnapshot.map(v => ({ ...v })),
+      worstStatus: currentSummary.worstStatus || latest?.worstStatus || "none",
+      worstSignal: currentSummary.worstSignal || latest?.worstSignal || "gray",
+      worstHex: currentSummary.worstHex || latest?.worstHex || TL_BASE_COLORS.gray,
+      priorityScore: currentSummary.priorityScore || latest?.priorityScore || 0,
+      hasCritical: currentSummary.hasCritical ?? !!latest?.hasCritical,
+      hasOverdue: currentSummary.hasOverdue ?? !!latest?.hasOverdue,
+      scheduledPendingCount: Number(currentSummary.scheduledPendingCount ?? latest?.scheduledPendingCount ?? 0),
       isTodayMarker: true,
     });
   }
 
-  const tasks = [];
-  entries.forEach(entry => {
-    (entry.organs || []).forEach(o => {
-      const tl = o._timeline;
-      if (!tl) return;
-      if (!tl.isOverdue && !tl.scheduledPending) return;
-      tasks.push({
-        id: `${entry.date}_${o.organ_id}_${tl.phase}`,
-        date: entry.date,
-        organ_id: o.organ_id,
-        type: tl.scheduledPending ? "scheduled_pending" : "overdue",
-        priorityScore: tl.priorityScore || 0,
-      });
-    });
-  });
+  const tasks = currentSnapshot
+    .filter(o => o?._timeline?.isOverdue || o?._timeline?.scheduledPending)
+    .map(o => ({
+      id: `${todayKey}_${o.organ_id}_${o?._timeline?.phase || "state"}`,
+      date: todayKey,
+      organ_id: o.organ_id,
+      type: o?._timeline?.scheduledPending ? "scheduled_pending" : "overdue",
+      priorityScore: o?._timeline?.priorityScore || 0,
+    }));
   tasks.sort((a, b) => (b.priorityScore || 0) - (a.priorityScore || 0));
 
   return { entries, tasks };
@@ -6552,19 +7593,25 @@ function VerticalTimelineBar({ entries, currentIdx, onTimeChange, tasks = [], co
   }, [indexed, mode]);
 
   const hasData = filtered.length > 0;
-  const minTs = hasData ? Math.min(...filtered.map(e => e.timestamp || 0)) : 0;
-  const maxTs = hasData ? Math.max(...filtered.map(e => e.timestamp || 0)) : 1;
-  const rangeTs = Math.max(1, maxTs - minTs);
   const topPad = 12;
   const bottomPad = 12;
   const usableH = Math.max(1, trackH - topPad - bottomPad);
 
-  const toRatio = ts => Math.max(0, Math.min(1, ((ts || minTs) - minTs) / rangeTs));
-  const toY = ts => topPad + toRatio(ts) * usableH;
-  const toTsByY = y => minTs + (Math.max(0, Math.min(usableH, y - topPad)) / usableH) * rangeTs;
+  const ratioByFilteredIndex = idx => {
+    if (!hasData) return 0;
+    if (filtered.length <= 1) return 1;
+    return Math.max(0, Math.min(1, idx / (filtered.length - 1)));
+  };
+  const toYByFilteredIndex = idx => topPad + ratioByFilteredIndex(idx) * usableH;
+  const getFilteredIndex = entry => filtered.findIndex(item => item._idx === entry?._idx);
+  const toY = entry => {
+    const idx = getFilteredIndex(entry);
+    return toYByFilteredIndex(idx >= 0 ? idx : 0);
+  };
+  const toRatioByY = y => Math.max(0, Math.min(1, (Math.max(0, Math.min(usableH, y - topPad)) / usableH)));
 
   const gradient = hasData
-    ? `linear-gradient(180deg, ${filtered.map(e => `${worstColor(e)} ${Math.round(toRatio(e.timestamp) * 100)}%`).join(", ")})`
+    ? `linear-gradient(180deg, ${filtered.map((e, idx) => `${worstColor(e)} ${Math.round(ratioByFilteredIndex(idx) * 100)}%`).join(", ")})`
     : "rgba(148,180,220,0.18)";
 
   const currentEntry = useMemo(() => {
@@ -6573,17 +7620,17 @@ function VerticalTimelineBar({ entries, currentIdx, onTimeChange, tasks = [], co
     if (direct) return direct;
     const fallback = indexed.find(e => e._idx === currentIdx);
     if (!fallback) return filtered[filtered.length - 1] || null;
-    return filtered.slice().sort((a, b) => Math.abs((a.timestamp || 0) - (fallback.timestamp || 0)) - Math.abs((b.timestamp || 0) - (fallback.timestamp || 0)))[0] || filtered[0];
+    return filtered.slice().sort((a, b) => Math.abs(getFilteredIndex(a) - getFilteredIndex(fallback)) - Math.abs(getFilteredIndex(b) - getFilteredIndex(fallback)))[0] || filtered[0];
   }, [hasData, filtered, indexed, currentIdx]);
 
-  const currentY = currentEntry ? toY(currentEntry.timestamp) : topPad;
+  const currentY = currentEntry ? toY(currentEntry) : topPad;
 
-  const pickNearest = (ts) => {
+  const pickNearest = (ratio) => {
     if (!hasData) return null;
     let best = filtered[0];
-    let bestD = Math.abs((best.timestamp || 0) - ts);
+    let bestD = Math.abs(ratioByFilteredIndex(0) - ratio);
     for (let i = 1; i < filtered.length; i++) {
-      const d = Math.abs((filtered[i].timestamp || 0) - ts);
+      const d = Math.abs(ratioByFilteredIndex(i) - ratio);
       if (d < bestD) { best = filtered[i]; bestD = d; }
     }
     return best;
@@ -6593,8 +7640,7 @@ function VerticalTimelineBar({ entries, currentIdx, onTimeChange, tasks = [], co
     if (!trackRef.current || !hasData) return;
     const rect = trackRef.current.getBoundingClientRect();
     const localY = clientY - rect.top;
-    const targetTs = toTsByY(localY);
-    const nearest = pickNearest(targetTs);
+    const nearest = pickNearest(toRatioByY(localY));
     if (nearest) onTimeChange(nearest._idx);
   };
 
@@ -6622,12 +7668,10 @@ function VerticalTimelineBar({ entries, currentIdx, onTimeChange, tasks = [], co
   const onWheel = e => {
     if (!hasData) return;
     e.preventDefault();
-    const dayStep = e.shiftKey ? 7 : 1;
-    const deltaDays = e.deltaY > 0 ? dayStep : -dayStep;
-    const baseTs = currentEntry?.timestamp || filtered[0]?.timestamp || minTs;
-    const targetTs = baseTs + deltaDays * 86400000;
-    const nearest = pickNearest(targetTs);
-    if (nearest) onTimeChange(nearest._idx);
+    const currentFilteredIdx = currentEntry ? getFilteredIndex(currentEntry) : 0;
+    const nextIdx = Math.max(0, Math.min(filtered.length - 1, currentFilteredIdx + (e.deltaY > 0 ? 1 : -1)));
+    const nextEntry = filtered[nextIdx];
+    if (nextEntry) onTimeChange(nextEntry._idx);
   };
 
   return (
@@ -6680,7 +7724,7 @@ function VerticalTimelineBar({ entries, currentIdx, onTimeChange, tasks = [], co
         <div style={{position:"absolute",left:"50%",top:topPad,bottom:bottomPad,width:4,transform:"translateX(-50%)",borderRadius:99,background:gradient}} />
 
         {hasData && filtered.map((e, i) => {
-          const y = toY(e.timestamp);
+          const y = toY(e);
           const active = e._idx === currentEntry?._idx;
           const overdue = !!e.hasOverdue;
           const pending = (e.scheduledPendingCount || 0) > 0;
@@ -6848,8 +7892,10 @@ function OrganCard({ r, radNotes, saveRadNote, aiState = "idle" }) {
   let lv = {}; try { lv = JSON.parse(r.lab_values||"{}"); } catch{}
   const stLabel = {sick:"Патология",warning:"Наблюдение",healthy:"Норма"}[r.status]||"Нет данных";
   const hasScanImages = !!r?._hasImages;
-  const aiLabel = aiState==="analyzing" ? "Gemini анализирует…" : aiState==="synced" ? "Gemini синхронизирован" : aiState==="error" ? "Gemini недоступен" : "Gemini: ожидание";
-  const aiColor = aiState==="analyzing" ? C.blue2 : aiState==="synced" ? C.green2 : aiState==="error" ? C.red2 : C.muted;
+  const displayStudyType = translateMedicalDisplay(r.study_type || "", { kind: "study_type" }) || r.study_type || "";
+  const rawConclusion = radNotes[`${r.study_type}_${r.organ_id}`] ?? (r.findings || "");
+  const displayConclusion = translateMedicalDisplay(rawConclusion, { kind: "conclusion", organId: r.organ_id, studyType: r.study_type }) || rawConclusion;
+  const showDisplayConclusion = displayConclusion && normalizeMedicalSearchText(displayConclusion) !== normalizeMedicalSearchText(stripSemanticTag(rawConclusion));
 
   return (
     <div style={{marginBottom:6,background:C.bg3,borderRadius:10,border:`1px solid ${r.status==="sick"?"rgba(239,68,68,0.22)":r.status==="warning"?"rgba(249,115,22,0.18)":C.border}`,overflow:"hidden"}}>
@@ -6865,7 +7911,7 @@ function OrganCard({ r, radNotes, saveRadNote, aiState = "idle" }) {
       </div>
       {expanded&&(
         <div style={{padding:"10px 12px",borderTop:`1px solid ${C.border}`,animation:"fadeUp 0.16s ease both"}}>
-          {r.study_type&&<div style={{fontSize:9,color:"rgba(3,194,252,0.6)",fontWeight:700,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:8}}>{r.study_type}</div>}
+          {displayStudyType&&<div style={{fontSize:9,color:"rgba(3,194,252,0.6)",fontWeight:700,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:8}}>{displayStudyType}</div>}
           {hasScanImages && (
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
               <ScanCard status={r.status} label="Срез A"/>
@@ -6884,11 +7930,15 @@ function OrganCard({ r, radNotes, saveRadNote, aiState = "idle" }) {
           <div>
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginBottom:5}}>
               <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase"}}>Заключение</div>
-              <div style={{fontSize:8,color:aiColor,fontWeight:700,letterSpacing:"0.03em"}}>{aiLabel}</div>
             </div>
+            {showDisplayConclusion && (
+              <div style={{marginBottom:6,padding:"7px 10px",borderRadius:8,background:`${sc2}10`,border:`1px solid ${sc2}18`,fontSize:10,color:C.text,lineHeight:1.55}}>
+                {displayConclusion}
+              </div>
+            )}
             <textarea rows={3}
               placeholder={`Заключение по ${OM[r.organ_id]?.n||r.organ_id}...`}
-              value={radNotes[`${r.study_type}_${r.organ_id}`] ?? (r.findings||"")}
+              value={rawConclusion}
               onChange={e=>saveRadNote(`${r.study_type}_${r.organ_id}`, e.target.value)}
               style={{width:"100%",padding:"9px 12px",background:"rgba(148,180,220,0.04)",border:`1.5px solid ${C.border}`,borderRadius:9,fontSize:11,outline:"none",color:C.text,fontFamily:"inherit",lineHeight:1.65,resize:"vertical",boxSizing:"border-box",transition:"border-color 0.2s"}}
               onFocus={e=>e.target.style.borderColor="rgba(59,130,246,0.4)"} onBlur={e=>e.target.style.borderColor=C.border}
@@ -6900,16 +7950,16 @@ function OrganCard({ r, radNotes, saveRadNote, aiState = "idle" }) {
   );
 }
 
-function EMRExplorerOverview({ rows, aiState = "idle", radNotes, saveRadNote, fields, setFields }) {
+function EMRExplorerOverview({ rows, aiState = "idle", radNotes, saveRadNote, fields, setFields, onSelectRow }) {
   const [selectedEntryId, setSelectedEntryId] = useState(null);
 
-  const aiLabel = aiState==="analyzing" ? "Gemini анализирует…" : aiState==="synced" ? "Gemini синхронизирован" : aiState==="error" ? "Gemini недоступен" : "Gemini: ожидание";
-  const aiColor = aiState==="analyzing" ? C.blue2 : aiState==="synced" ? C.green2 : aiState==="error" ? C.red2 : C.muted;
-
-  const docEntries = useMemo(() => ([
-    { id: "doc:symptoms", label: "Заметки и симптомы", field: "symptoms" },
-    { id: "doc:treatment", label: "Лечение и назначения", field: "treatment" },
-  ]), []);
+  const docEntries = useMemo(() => {
+    const source = fields || {};
+    return [
+      { id: "doc:symptoms", label: "Заметки врача", field: "symptoms" },
+      { id: "doc:treatment", label: "Назначенное лечение", field: "treatment" },
+    ].filter(doc => String(source?.[doc.field] || "").trim());
+  }, [fields?.symptoms, fields?.treatment]);
 
   const dateTs = (value) => {
     const raw = String(value || "").trim();
@@ -6942,21 +7992,41 @@ function EMRExplorerOverview({ rows, aiState = "idle", radNotes, saveRadNote, fi
     const isDoc = String(selectedEntryId || "").startsWith("doc:");
     if (isDoc) return;
     if (!filteredRows.length) {
-      setSelectedEntryId("doc:symptoms");
+      setSelectedEntryId(docEntries[0]?.id || null);
       return;
     }
     if (!selectedEntryId || !filteredRows.some(r => r._rowId === selectedEntryId)) {
       setSelectedEntryId(filteredRows[0]._rowId);
     }
-  }, [filteredRows, selectedEntryId]);
+  }, [filteredRows, selectedEntryId, docEntries]);
+
+  useEffect(() => {
+    if (!String(selectedEntryId || "").startsWith("doc:")) return;
+    if (docEntries.some(d => d.id === selectedEntryId)) return;
+    if (filteredRows.length) {
+      setSelectedEntryId(filteredRows[0]._rowId);
+      return;
+    }
+    setSelectedEntryId(docEntries[0]?.id || null);
+  }, [selectedEntryId, docEntries, filteredRows]);
 
   const selectedRow = filteredRows.find(r => r._rowId === selectedEntryId) || null;
   const selectedDoc = docEntries.find(d => d.id === selectedEntryId) || null;
-  const selectedNoteKey = selectedRow ? `${selectedRow.study_type || ""}_${selectedRow.organ_id || ""}` : "";
+  const selectedNoteKey = selectedRow
+    ? (selectedRow._timeline_item_id ? `timeline:${selectedRow._timeline_item_id}` : `${selectedRow.study_type || ""}_${selectedRow.organ_id || ""}`)
+    : "";
   const selectedConclusion = selectedRow ? (radNotes?.[selectedNoteKey] ?? (selectedRow.findings || "")) : "";
   const selectedStudyName = selectedRow?.study_type || "Исследование";
+  const selectedStudyLabel = translateMedicalDisplay(selectedStudyName, { kind: "study_type" }) || selectedStudyName;
   const selectedOrganName = selectedRow ? (OM[selectedRow.organ_id]?.n || selectedRow.organ_id) : "";
+  const selectedConclusionDisplay = selectedRow ? (translateMedicalDisplay(selectedConclusion, { kind: "conclusion", organId: selectedRow.organ_id, studyType: selectedRow.study_type }) || selectedConclusion) : "";
+  const showSelectedConclusionDisplay = !!selectedRow && !!selectedConclusionDisplay && normalizeMedicalSearchText(selectedConclusionDisplay) !== normalizeMedicalSearchText(stripSemanticTag(selectedConclusion));
   const selectedModality = /mri|mr|мрт/i.test(selectedStudyName) ? "МРТ" : /ct|кт/i.test(selectedStudyName) ? "КТ" : "Снимок";
+  const hasDocSection = docEntries.length > 0;
+
+  useEffect(() => {
+    if (typeof onSelectRow === "function") onSelectRow(selectedRow || null);
+  }, [selectedRow?._rowId, onSelectRow]);
 
   const fileBtnStyle = (active) => ({
     width:"100%",
@@ -6987,7 +8057,6 @@ function EMRExplorerOverview({ rows, aiState = "idle", radNotes, saveRadNote, fi
     <div style={{marginBottom:16,background:C.bg3,border:`1px solid ${C.border}`,borderRadius:10,overflow:"hidden"}}>
       <div style={{padding:"9px 10px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}>
         <div style={{fontSize:10,fontWeight:700,color:C.dim,letterSpacing:"0.05em",textTransform:"uppercase"}}>Файлы пациента</div>
-        <div style={{fontSize:9,color:aiColor,fontWeight:700,letterSpacing:"0.03em"}}>{aiLabel}</div>
       </div>
 
       <div style={{padding:"8px 8px 12px"}}>
@@ -6998,11 +8067,12 @@ function EMRExplorerOverview({ rows, aiState = "idle", radNotes, saveRadNote, fi
           ) : filteredRows.map(r => {
             const active = selectedEntryId === r._rowId;
             const organName = OM[r.organ_id]?.n || r.organ_id;
+            const studyLabel = translateMedicalDisplay(r.study_type || "", { kind: "study_type" }) || r.study_type || "Исследование";
             return (
               <button key={r._rowId} onClick={() => setSelectedEntryId(r._rowId)} style={fileBtnStyle(active)}>
                 <span style={{display:"flex",alignItems:"center",justifyContent:"center",color:active ? C.blue2 : C.muted}}>{fileIcon}</span>
                 <span style={{minWidth:0}}>
-                  <span style={{display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.study_type || "Исследование"} · {organName}</span>
+                  <span style={{display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{studyLabel} · {organName}</span>
                   <span style={{display:"block",fontSize:9,color:C.muted,marginTop:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
                     {r.study_date || "Дата не указана"}
                   </span>
@@ -7013,43 +8083,54 @@ function EMRExplorerOverview({ rows, aiState = "idle", radNotes, saveRadNote, fi
           })}
         </div>
 
-        <div style={{height:1,background:C.border,margin:"10px 4px 8px"}}/>
-        <div style={{padding:"0 2px 5px",fontSize:9,color:C.muted,fontWeight:700,letterSpacing:"0.05em",textTransform:"uppercase"}}>Документы пациента</div>
-        <div>
-          {docEntries.map(doc => {
-            const active = selectedEntryId === doc.id;
-            return (
-              <button key={doc.id} onClick={() => setSelectedEntryId(doc.id)} style={fileBtnStyle(active)}>
-                <span style={{display:"flex",alignItems:"center",justifyContent:"center",color:active ? C.blue2 : C.muted}}>{fileIcon}</span>
-                <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{doc.label}</span>
-                <span style={{fontSize:10,color:C.muted,fontFamily:C.mono}}>txt</span>
-              </button>
-            );
-          })}
-        </div>
+        {docEntries.length > 0 && (
+          <>
+            <div style={{height:1,background:C.border,margin:"10px 4px 8px"}}/>
+            <div style={{padding:"0 2px 5px",fontSize:9,color:C.muted,fontWeight:700,letterSpacing:"0.05em",textTransform:"uppercase"}}>Документы пациента</div>
+            <div>
+              {docEntries.map(doc => {
+                const active = selectedEntryId === doc.id;
+                return (
+                  <button key={doc.id} onClick={() => setSelectedEntryId(doc.id)} style={fileBtnStyle(active)}>
+                    <span style={{display:"flex",alignItems:"center",justifyContent:"center",color:active ? C.blue2 : C.muted}}>{fileIcon}</span>
+                    <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{doc.label}</span>
+                    <span style={{fontSize:10,color:C.muted,fontFamily:C.mono}}>txt</span>
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{height:1,background:C.border,margin:"10px 4px 8px"}}/>
+          </>
+        )}
 
-        <div style={{height:1,background:C.border,margin:"10px 4px 8px"}}/>
         {selectedDoc && (
           <div style={{padding:"2px 4px 2px"}}>
             <div style={{fontSize:10,color:C.muted,marginBottom:8}}>
               Пациент / документы / <span style={{color:C.text,fontWeight:700}}>{selectedDoc.label}</span>
             </div>
-            <textarea
-              rows={selectedDoc.field === "symptoms" ? 5 : 6}
-              placeholder={selectedDoc.field === "symptoms" ? "Жалобы, симптомы пациента..." : "Схема лечения, препараты, дозировки, процедуры..."}
-              value={fields?.[selectedDoc.field] || ""}
-              onChange={e=>setFields(f=>({ ...f, [selectedDoc.field]: e.target.value }))}
-              style={{width:"100%",padding:"10px 12px",background:"rgba(148,180,220,0.04)",border:`1.5px solid ${C.border}`,borderRadius:9,fontSize:11,outline:"none",color:C.text,fontFamily:"inherit",lineHeight:1.65,resize:"vertical",boxSizing:"border-box",transition:"border-color 0.2s"}}
-              onFocus={e=>e.target.style.borderColor="rgba(59,130,246,0.45)"}
-              onBlur={e=>e.target.style.borderColor=C.border}
-            />
+            <div style={{
+              width:"100%",
+              minHeight:selectedDoc.field === "symptoms" ? 108 : 128,
+              padding:"10px 12px",
+              background:"rgba(148,180,220,0.04)",
+              border:`1.5px solid ${C.border}`,
+              borderRadius:9,
+              fontSize:11,
+              color:C.text,
+              lineHeight:1.7,
+              boxSizing:"border-box",
+              whiteSpace:"pre-wrap",
+              wordBreak:"break-word",
+            }}>
+              {String(fields?.[selectedDoc.field] || "").trim()}
+            </div>
           </div>
         )}
 
         {selectedRow && (
-          <div style={{padding:"2px 4px 2px"}}>
+          <div style={{padding: hasDocSection ? "2px 4px 2px" : "0 4px 2px"}}>
             <div style={{fontSize:10,color:C.muted,marginBottom:8}}>
-              Пациент / анализы / {selectedStudyName} / <span style={{color:C.text,fontWeight:700}}>{selectedOrganName}</span>
+              Пациент / анализы / {selectedStudyLabel} / <span style={{color:C.text,fontWeight:700}}>{selectedOrganName}</span>
             </div>
             {!!selectedRow._hasImages && (
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
@@ -7058,6 +8139,11 @@ function EMRExplorerOverview({ rows, aiState = "idle", radNotes, saveRadNote, fi
               </div>
             )}
             <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:5}}>Заключение</div>
+            {showSelectedConclusionDisplay && (
+              <div style={{marginBottom:6,padding:"7px 10px",borderRadius:8,background:"rgba(3,194,252,0.08)",border:`1px solid ${C.border}`,fontSize:10,color:C.text,lineHeight:1.55}}>
+                {selectedConclusionDisplay}
+              </div>
+            )}
             <textarea
               rows={3}
               placeholder={`Заключение по ${selectedOrganName}...`}
@@ -7087,6 +8173,7 @@ function PatientRecord({
   isolateLayerEnabled = false,
   canIsolateLayer = false,
   onToggleIsolateLayer,
+  onSelectStudyRow,
 }) {
   useDB();
   const [aiLiveState, setAiLiveState] = useState("idle");
@@ -7127,14 +8214,15 @@ function PatientRecord({
     }
   };
 
-  // All organ studies sorted alphabetically by study_type
+  // Current organ slice + full history for file explorer
   const organRows = dbQuery("SELECT * FROM organ_data WHERE patient_id=? AND organ_id NOT IN ('__record__','__ai__')", [patient.id]);
+  const timelineSourceRows = getPatientTimelineSourceRows(patient.id);
   const timelineRowsForImages = dbQuery(
-    "SELECT organ_id,study_type,dicom_refs,payload,date_iso,id FROM timeline_items WHERE patient_id=? ORDER BY date_iso DESC, id DESC",
+    "SELECT organ_id,study_type,dicom_refs,payload,conclusion,date_iso,id FROM timeline_items WHERE patient_id=? ORDER BY date_iso DESC, id DESC",
     [patient.id]
   );
   const timelineRowsForImagesSig = timelineRowsForImages
-    .map(r => `${r.id || ""}|${r.organ_id || ""}|${r.study_type || ""}|${r.date_iso || ""}|${r.dicom_refs || ""}|${r.payload || ""}`)
+    .map(r => `${r.id || ""}|${r.organ_id || ""}|${r.study_type || ""}|${r.date_iso || ""}|${r.dicom_refs || ""}|${r.payload || ""}|${r.conclusion || ""}`)
     .join("||");
   const timelineImageIndex = useMemo(() => {
     return buildTimelineImageIndexForRows(timelineRowsForImages);
@@ -7144,16 +8232,39 @@ function PatientRecord({
   try { aiOverlayData = JSON.parse(aiOverlayRow?.findings || "{}"); } catch {}
   const aiOverlayMap = canonicalizeOrganMap(aiOverlayData.organMap || {});
   const STATUS_PRIORITY = { sick: 3, warning: 2, healthy: 1, none: 0 };
-  const resolveDisplayStatus = (baseStatus, organId) => {
-    const b = String(baseStatus || "none");
+  const resolveDisplayStatus = (rowOrStatus, organId) => {
+    const b = typeof rowOrStatus === "object"
+      ? resolveRowClinicalStatus(rowOrStatus, rowOrStatus?.status)
+      : String(rowOrStatus || "none");
     const a = String(aiOverlayMap?.[organId] || "");
     return (STATUS_PRIORITY[a] ?? 0) > (STATUS_PRIORITY[b] ?? 0) ? a : b;
   };
-  const resolvedOrganRows = organRows.map(r => ({
-    ...r,
-    status: resolveDisplayStatus(r.status, r.organ_id),
-    _hasImages: hasTimelineImages(timelineImageIndex, r.organ_id, r.study_type),
-  }));
+  const resolvedOrganRows = organRows.map(r => {
+    const resolvedOrganId = resolveClinicalOrganId(r.organ_id, r.study_type, r.findings, r.notes);
+    return {
+      ...r,
+      organ_id: resolvedOrganId,
+      _source_organ_id: r.organ_id,
+      status: resolveDisplayStatus(r, resolvedOrganId),
+      _hasImages: hasTimelineImages(timelineImageIndex, resolvedOrganId, r.study_type),
+    };
+  });
+  const timelineSourceSignature = timelineSourceRows
+    .map(r => `${r._timeline_item_id || ""}|${r.organ_id || ""}|${r.study_type || ""}|${r.study_date || ""}|${r.date_iso || ""}|${r.findings || ""}|${r.notes || ""}|${r.status || ""}`)
+    .join("||");
+  const resolvedStudyRows = useMemo(() => {
+    return (timelineSourceRows || []).map(r => {
+      const resolvedOrganId = resolveClinicalOrganId(r.organ_id, r.study_type, r.findings, r.notes);
+      return {
+        ...r,
+        organ_id: resolvedOrganId,
+        _source_organ_id: r.organ_id,
+        status: resolveRowClinicalStatus(r, r?.status),
+        study_date: formatStudyDateDisplay(r.date_iso || r.study_date || ""),
+        _hasImages: hasTimelineImages(timelineImageIndex, resolvedOrganId, r.study_type),
+      };
+    });
+  }, [timelineSourceSignature, timelineRowsForImagesSig]);
 
   const saveRadNote = (scanKey, val) => {
     const updated = { ...radNotes, [scanKey]: val };
@@ -7175,9 +8286,10 @@ function PatientRecord({
   useEffect(() => {
     let cancelled = false;
     const t = setTimeout(async () => {
+      const relevantOrganRows = organRows.filter(r => resolveRowClinicalStatus(r, r?.status) !== "none");
       const studyKeys = new Set();
       const conclusionChunks = [];
-      organRows.forEach(r => {
+      relevantOrganRows.forEach(r => {
         const key = `${r.study_type || ""}_${r.organ_id || ""}`;
         studyKeys.add(key);
         const fromCard = String(radNotes?.[key] ?? "").trim();
@@ -7208,7 +8320,7 @@ function PatientRecord({
       try {
         const results = await analyzeText(liveText);
         const organMap = mergeAnalysisToOrgans(results || []);
-        organRows.forEach(r => {
+        relevantOrganRows.forEach(r => {
           const key = `${r.study_type || ""}_${r.organ_id || ""}`;
           const txt = String(radNotes?.[key] ?? r?.findings ?? "").trim();
           const heur = inferStatusFromConclusionText(txt);
@@ -7248,10 +8360,12 @@ function PatientRecord({
 
   // Current organ tab data
   const activeOrganData = activeOrganTab ? dbGetOne("SELECT * FROM organ_data WHERE patient_id=? AND organ_id=?", [patient.id, activeOrganTab]) : null;
-  const activeOrganStatus = resolveDisplayStatus(activeOrganData?.status, activeOrganData?.organ_id);
+  const activeOrganStatus = activeOrganData ? resolveDisplayStatus(activeOrganData, activeOrganData?.organ_id) : "none";
   const activeHasImages = !!(activeOrganData && hasTimelineImages(timelineImageIndex, activeOrganData.organ_id, activeOrganData.study_type));
   const activeMeta = activeOrganTab ? OM[activeOrganTab] : null;
   const sc = activeOrganData ? ({sick:C.red2,warning:C.orange2,healthy:C.green2}[activeOrganStatus]||C.muted) : C.muted;
+  const activeStudyTypeDisplay = translateMedicalDisplay(activeOrganData?.study_type || "", { kind: "study_type" }) || activeOrganData?.study_type || "";
+  const activeFindingsDisplay = translateMedicalDisplay(activeOrganData?.findings || "", { kind: "conclusion", organId: activeOrganData?.organ_id, studyType: activeOrganData?.study_type }) || activeOrganData?.findings || "";
 
   return (
     <div style={{flex:1,display:"flex",flexDirection:"column",height:"100%",overflow:"hidden",background:C.bg}}>
@@ -7323,12 +8437,13 @@ function PatientRecord({
 
             {/* ─ Studies sorted alphabetically ─ */}
             <EMRExplorerOverview
-              rows={resolvedOrganRows}
+              rows={resolvedStudyRows}
               radNotes={radNotes}
               saveRadNote={saveRadNote}
               aiState={aiLiveState}
               fields={fields}
               setFields={setFields}
+              onSelectRow={onSelectStudyRow}
             />
           </div>
         )}
@@ -7347,7 +8462,7 @@ function PatientRecord({
                   ? <div style={{fontSize:11,color:sc,fontWeight:600,marginTop:3,display:"flex",alignItems:"center",gap:6}}>
                       <div style={{width:6,height:6,borderRadius:"50%",background:sc,boxShadow:`0 0 5px ${sc}`}}/>
                       {({sick:"Патология",warning:"Наблюдение",healthy:"Норма"})[activeOrganStatus]||activeOrganStatus}
-                      {activeOrganData.study_type&&<span style={{color:C.muted,fontWeight:400}}>· {activeOrganData.study_type}</span>}
+                      {activeStudyTypeDisplay&&<span style={{color:C.muted,fontWeight:400}}>· {activeStudyTypeDisplay}</span>}
                       {activeOrganData.study_date&&<span style={{color:C.muted,fontFamily:C.mono,fontWeight:400,fontSize:10}}>{activeOrganData.study_date}</span>}
                     </div>
                   : <div style={{fontSize:11,color:C.muted,marginTop:3}}>Исследований не проводилось</div>
@@ -7393,7 +8508,7 @@ function PatientRecord({
                 {activeOrganData.findings&&(
                   <div style={{marginBottom:16}}>
                     <div style={{fontSize:8,fontWeight:700,color:C.muted,letterSpacing:"0.07em",textTransform:"uppercase",marginBottom:8}}>Заключение</div>
-                    <div style={{background:`${sc}07`,border:`1px solid ${sc}18`,borderLeft:`3px solid ${sc}`,borderRadius:9,padding:"11px 13px",fontSize:12,color:C.text,lineHeight:1.75}}>{activeOrganData.findings}</div>
+                    <div style={{background:`${sc}07`,border:`1px solid ${sc}18`,borderLeft:`3px solid ${sc}`,borderRadius:9,padding:"11px 13px",fontSize:12,color:C.text,lineHeight:1.75}}>{activeFindingsDisplay}</div>
                   </div>
                 )}
                 {/* Bone fracture */}
@@ -7824,6 +8939,7 @@ function DoctorDesktop({ user, onLogout }) {
   const [activeOrganLayer, setActiveOrganLayer] = useState(null);
   const [isolateLayerEnabled, setIsolateLayerEnabled] = useState(false);
   const [qualitySettings, setQualitySettings] = useState(() => loadQualitySettings());
+  const [selectedStudyDate, setSelectedStudyDate] = useState("");
   const topbarHeight = 54;
 
   const layerBtnRef = useRef(null);
@@ -7831,9 +8947,7 @@ function DoctorDesktop({ user, onLogout }) {
   const sidebarModelTimerRef = useRef(null);
   const closePatientTimerRef = useRef(null);
   const [modelGroups, setModelGroups] = useState([]);
-  const [groupVis, setGroupVis] = useState(() => {
-    const v = {}; TARGET_GROUPS.forEach(g => { v[g.name] = g.defaultOn !== false; }); return v;
-  });
+  const [groupVis, setGroupVis] = useState(() => buildDefaultGroupVisibility());
   const [showGroupPanel, setShowGroupPanel] = useState(false);
   const [xrayMode, setXrayMode] = useState(true);
   const [showTimeline, setShowTimeline] = useState(false);
@@ -7904,8 +9018,7 @@ function DoctorDesktop({ user, onLogout }) {
       clearTimeout(closePatientTimerRef.current);
       closePatientTimerRef.current = null;
     }
-    const organRows = dbQuery("SELECT organ_id,status FROM organ_data WHERE patient_id=? AND organ_id NOT IN ('__record__','__ai__')", [p.id]);
-    setGroupVis(buildAutoGroupVisibilityForRows(organRows));
+    setGroupVis(buildDefaultGroupVisibility());
     setSel(p);
     setSidebarOpen(true);
     scheduleSidebarModelMount();
@@ -7916,6 +9029,7 @@ function DoctorDesktop({ user, onLogout }) {
     setHoverOverlay(null);
     setCardsFrozen(false);
     setShowGroupPanel(false);
+    setSelectedStudyDate("");
   };
 
   const goBack = () => {
@@ -7933,6 +9047,7 @@ function DoctorDesktop({ user, onLogout }) {
     setHoverOverlay(null);
     setNavScene(null);
     setCardsFrozen(false);
+    setSelectedStudyDate("");
     if (closePatientTimerRef.current) clearTimeout(closePatientTimerRef.current);
     closePatientTimerRef.current = setTimeout(() => {
       setSel(null);
@@ -8066,6 +9181,7 @@ function DoctorDesktop({ user, onLogout }) {
                   cardsFrozen={cardsFrozen}
                   maxHoverCards={safeQuality.maxInfoCards}
                   qualitySettings={safeQuality}
+                  selectedStudyDate={selectedStudyDate}
                 />
                 <SidebarControlMenu
                   showGroupPanel={showGroupPanel} setShowGroupPanel={setShowGroupPanel}
@@ -8224,6 +9340,7 @@ function DoctorDesktop({ user, onLogout }) {
               isolateLayerEnabled={isolateLayerEnabled}
               canIsolateLayer={!!activeOrganLayer}
               onToggleIsolateLayer={toggleLayerIsolation}
+              onSelectStudyRow={(row) => setSelectedStudyDate(String(row?.date_iso || row?.study_date || ""))}
             />
           )}
         </div>
@@ -8253,9 +9370,7 @@ function DoctorMobile({ user, onLogout }) {
   const [showLegend, setShowLegend] = useState(false);
   const [qualitySettings, setQualitySettings] = useState(() => loadQualitySettings());
   const [modelGroups, setModelGroups] = useState([]);
-  const [groupVis, setGroupVis] = useState(() => {
-    const v = {}; TARGET_GROUPS.forEach(g => { v[g.name] = g.defaultOn !== false; }); return v;
-  });
+  const [groupVis, setGroupVis] = useState(() => buildDefaultGroupVisibility());
   const toggleGroup = (name, bulk) => {
     if (name === "__set__" && bulk) {
       setGroupVis(normalizeGroupVisibility(bulk, false));
@@ -8300,8 +9415,7 @@ function DoctorMobile({ user, onLogout }) {
           {filtered.length===0&&<div style={{padding:"60px 20px",textAlign:"center",color:C.muted}}><div style={{fontSize:40,opacity:0.1,marginBottom:12}}></div><div>Пациентов нет</div></div>}
           {filtered.map(p=>(
             <div key={p.id} onClick={()=>{
-              const organRows = dbQuery("SELECT organ_id,status FROM organ_data WHERE patient_id=? AND organ_id NOT IN ('__record__','__ai__')", [p.id]);
-              setGroupVis(buildAutoGroupVisibilityForRows(organRows));
+              setGroupVis(buildDefaultGroupVisibility());
               setPat(p);
               setView("patient");
             }}

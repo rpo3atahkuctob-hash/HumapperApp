@@ -35,6 +35,9 @@ _client = genai.Client(api_key=API_KEY) if API_KEY else None
 _cloud_lock = threading.Lock()
 
 ALLOWED_ORGANS = [
+    "general",
+    "oral_cavity",
+    "nasal_sinuses",
     "skull",
     "tmj",
     "hyoid_laryngeal",
@@ -150,6 +153,11 @@ ORGAN_ID_ALIASES = {
     "ankle": "ankle_joint",
     "foot": "foot_bones",
     "foot_joint": "foot_joints",
+    "sinus": "nasal_sinuses",
+    "sinuses": "nasal_sinuses",
+    "nasal_sinuses": "nasal_sinuses",
+    "paranasal_sinus": "nasal_sinuses",
+    "paranasal_sinuses": "nasal_sinuses",
 }
 
 
@@ -202,7 +210,7 @@ def _load_prompt_template() -> str:
         "Разрешённые organ ids: [<ALLOWED_ORGANS>]\n"
         "Разрешённые statuses: [<ALLOWED_STATUSES>]\n"
         "Формат: {{\"results\":[{{\"disease\":\"...\",\"severity\":\"sick\","
-        "\"confidence\":0.9,\"organs\":[{{\"id\":\"heart\",\"status\":\"sick\"}}]}}]}}\n"
+        "\"confidence\":0.9,\"organs\":[{{\"id\":\"general\",\"status\":\"warning\"}}]}}]}}\n"
         "Медицинский текст:\n<MEDICAL_TEXT>"
     )
 

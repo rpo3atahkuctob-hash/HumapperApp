@@ -32,6 +32,19 @@ SCHEMA_VERSION = "humapper-patientdb/v1"
 
 
 ORGAN_KEYWORDS: List[Tuple[str, Tuple[str, ...]]] = [
+    ("wrist_joint", ("sprain of wrist", "wrist sprain", "wrist injury")),
+    ("ankle_joint", ("sprain of ankle", "ankle sprain", "ankle injury")),
+    ("knee_joint", ("sprain of knee", "knee sprain", "knee injury")),
+    ("shoulder_joint", ("sprain of shoulder", "shoulder sprain", "shoulder injury")),
+    ("elbow_joint", ("sprain of elbow", "elbow sprain", "elbow injury")),
+    ("oral_cavity", ("gingivitis", "gingival", "gum", "gums", "periodont", "dental", "dentist", "dentition", "tooth", "teeth", "incisor", "canine", "premolar", "molar", "caries", "oral surgery", "oral cavity", "mouth", "alveolar", "stomat")),
+    ("tmj", ("temporomandibular", "tmj", "jaw joint", "mandibular joint")),
+    ("salivary_glands", ("parotid", "submandibular", "sublingual", "salivary", "xerostomia", "sialaden")),
+    ("tonsils", ("tonsill", "tonsil", "adenoid")),
+    ("tongue", ("tongue", "glossitis", "glossal", "uvula")),
+    ("skull", ("sinusitis", "rhinitis", "allergic rhinitis")),
+    ("hyoid_laryngeal", ("pharyngitis", "laryngitis")),
+    ("skull", ("maxillofacial trauma", "mandibular fracture", "maxillary fracture", "jaw fracture", "facial skeleton")),
     ("heart", ("heart", "cardiac", "myocard", "coronary", "arrhythm", "angina")),
     ("lung_left", ("left lung", "left lower lobe", "left upper lobe", "pulmonary left")),
     ("lung_right", ("right lung", "right lower lobe", "right upper lobe", "pulmonary right")),
@@ -52,6 +65,33 @@ ORGAN_KEYWORDS: List[Tuple[str, Tuple[str, ...]]] = [
     ("ovary_left", ("ovary", "ovarian")),
     ("spine", ("spine", "vertebra", "lumbar", "thoracic", "cervical pain")),
 ]
+
+GENERAL_CONTEXT_KEYWORDS: Tuple[str, ...] = (
+    "reports of violence in the environment",
+    "violence in the environment",
+    "victim of intimate partner abuse",
+    "intimate partner abuse",
+    "domestic violence",
+    "risk activity involvement",
+    "risk taking behavior",
+    "received higher education",
+    "higher education",
+    "full-time employment",
+    "full time employment",
+    "employment",
+    "medication review due",
+    "medication review",
+    "review due",
+    "wellness",
+    "preventive visit",
+    "annual exam",
+    "stress",
+    "body mass index",
+    "bmi",
+    "obesity",
+    "hyperlipidemia",
+    "dyslipidemia",
+)
 
 
 RED_HINTS = (
@@ -155,10 +195,12 @@ def display_date_from_iso(iso_value: str) -> str:
 def infer_organ_id(text: str) -> str:
     lowered = (text or "").lower()
     lowered = re.sub(r"\s+", " ", lowered)
+    if any(k in lowered for k in GENERAL_CONTEXT_KEYWORDS):
+        return "general"
     for organ, keywords in ORGAN_KEYWORDS:
         if any(k in lowered for k in keywords):
             return organ
-    return "heart"
+    return "general"
 
 
 def infer_color(text: str) -> str:
